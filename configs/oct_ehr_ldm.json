@@ -1,0 +1,74 @@
+{
+  "project_root": "..",
+  "paths": {
+    "ehr_with_oct": "data/ukbehr_ehr_with_oct.pt",
+    "ehr_only": "data/ukbehr_ehr_only.pt",
+    "oct_index": "/data/home/wanglidi/code/encode_oct/data/OCT_eid.json",
+    "split_manifest": "outputs/data/split_manifest.json",
+    "cxr_autoencoder_checkpoint": "model-zoo/models/cxr_image_synthesis_latent_diffusion_model/models/autoencoder.pth",
+    "cxr_diffusion_checkpoint": "model-zoo/models/cxr_image_synthesis_latent_diffusion_model/models/diffusion_model.pth",
+    "oct_autoencoder_checkpoint": "outputs/autoencoder/best.pt",
+    "autoencoder_output_dir": "outputs/autoencoder",
+    "alignment_output_dir": "outputs/diffusion_alignment",
+    "full_output_dir": "outputs/diffusion_full"
+  },
+  "data": {
+    "image_size": 512,
+    "resize_mode": "pad",
+    "val_fraction": 0.1,
+    "split_seed": 2026,
+    "fail_missing_images": true,
+    "batch_size": 2,
+    "num_workers": 4,
+    "prefetch_factor": 2,
+    "intensity_augmentation": 0.03
+  },
+  "training": {
+    "seed": 2026,
+    "device": "auto",
+    "precision": "auto",
+    "gradient_accumulation_steps": 4,
+    "gradient_clip_norm": 1.0,
+    "warmup_fraction": 0.03,
+    "log_every_steps": 20
+  },
+  "autoencoder": {
+    "epochs": 20,
+    "learning_rate": 0.00001,
+    "weight_decay": 0.01,
+    "kl_weight": 0.000001,
+    "perceptual_weight": 0.001,
+    "activation_checkpointing": false,
+    "max_val_batches": null
+  },
+  "condition": {
+    "num_tokens": 8,
+    "hidden_dim": 2048,
+    "view_embedding_dim": 32,
+    "dropout_probability": 0.1
+  },
+  "diffusion": {
+    "scale_factor": null,
+    "scale_estimation_batches": 50,
+    "use_ema": true,
+    "ema_decay": 0.9999,
+    "use_ema_for_phase_init": true,
+    "max_val_batches": 20,
+    "alignment": {
+      "max_steps": 10000,
+      "unet_learning_rate": 0.00001,
+      "projector_learning_rate": 0.0001,
+      "weight_decay": 0.01,
+      "validate_every_steps": 500,
+      "save_every_steps": 500
+    },
+    "full": {
+      "max_steps": 100000,
+      "unet_learning_rate": 0.00001,
+      "projector_learning_rate": 0.00005,
+      "weight_decay": 0.01,
+      "validate_every_steps": 1000,
+      "save_every_steps": 1000
+    }
+  }
+}
