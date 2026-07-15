@@ -251,4 +251,4 @@ fabric.properties
 outputs
 data/
 model-zoo/
-*.swp
+local_tests/
