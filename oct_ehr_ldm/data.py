@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
 
 from .config import ProjectConfig
 
@@ -67,7 +68,7 @@ def load_ehr_dictionary(path: str | Path) -> dict[int, torch.Tensor]:
         raise TypeError(f"Expected a pure patient->latent dictionary in {path}; got {type(raw)!r}")
     normalized: dict[int, torch.Tensor] = {}
     expected_dim: int | None = None
-    for raw_id, raw_latent in raw.items():
+    for raw_id, raw_latent in tqdm(raw.items(), desc="Loading EHR latents", unit="patient"):
         patient_id = normalize_patient_id(raw_id)
         if patient_id in normalized:
             raise ValueError(f"Duplicate normalized patient ID {patient_id} in {path}")
@@ -90,7 +91,7 @@ def load_oct_index(path: str | Path) -> dict[int, list[str]]:
     if not isinstance(raw, dict):
         raise TypeError(f"OCT index must be a JSON object: {path}")
     normalized: dict[int, list[str]] = {}
-    for raw_id, raw_paths in raw.items():
+    for raw_id, raw_paths in tqdm(raw.items(), desc="Loading OCT index", unit="patient"):
         patient_id = normalize_patient_id(raw_id)
         if isinstance(raw_paths, str):
             paths = [raw_paths]
@@ -114,7 +115,8 @@ def build_records(
 ) -> tuple[list[OCTRecord], list[str]]:
     records: list[OCTRecord] = []
     missing: list[str] = []
-    for patient_id in sorted(ehr_by_patient.keys() & oct_by_patient.keys()):
+    paired_patient_ids = sorted(ehr_by_patient.keys() & oct_by_patient.keys())
+    for patient_id in tqdm(paired_patient_ids, desc="Validating paired OCT", unit="patient"):
         for raw_path in oct_by_patient[patient_id]:
             image_path = str(Path(raw_path).expanduser())
             if not Path(image_path).is_file():

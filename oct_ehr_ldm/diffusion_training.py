@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import math
 import time
+from itertools import islice
 from pathlib import Path
 from typing import Any, Iterable
 
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from tqdm.auto import tqdm
 
 from .config import ProjectConfig
 from .data import (
@@ -81,9 +83,8 @@ def compute_latent_scale_factor(
     value_sum = 0.0
     square_sum = 0.0
     count = 0
-    for batch_index, batch in enumerate(loader):
-        if batch_index >= max_batches:
-            break
+    total = max(0, min(len(loader), max_batches))
+    for batch in tqdm(islice(loader, total), total=total, desc="Estimating latent scale", unit="batch", leave=False):
         images = batch["image"].to(device, non_blocking=True)
         with autocast_context(device, dtype, amp_enabled):
             latent = autoencoder.encode_stage_2_inputs(images)
@@ -190,9 +191,9 @@ def validate_diffusion(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(314159)
     try:
-        for batch_index, batch in enumerate(loader):
-            if batch_index >= max_batches:
-                break
+        total = max(0, min(len(loader), max_batches))
+        description = "Comparing conditions" if compare_conditions else "Validating diffusion"
+        for batch in tqdm(islice(loader, total), total=total, desc=description, unit="batch", leave=False):
             images = batch["image"].to(device, non_blocking=True)
             ehr = batch["ehr"].to(device, non_blocking=True)
             view_ids = batch["view_id"].to(device, non_blocking=True)
@@ -409,6 +410,12 @@ def train_diffusion(
     running_loss = 0.0
     running_batches = 0
 
+    training_progress = tqdm(
+        total=max_steps,
+        initial=global_step,
+        desc=f"Training diffusion ({phase})",
+        unit="step",
+    )
     while global_step < max_steps:
         loader = create_loader(train_dataset, config, training=True, epoch=epoch)
         diffusion.train()
@@ -451,6 +458,8 @@ def train_diffusion(
             optimizer.zero_grad(set_to_none=True)
             lr_scheduler.step()
             global_step += 1
+            training_progress.update(1)
+            training_progress.set_postfix(loss=f"{loss.item():.4f}", epoch=epoch)
             if ema is not None:
                 ema.update({"diffusion": diffusion, "projector": projector})
 
@@ -522,6 +531,7 @@ def train_diffusion(
                 break
         epoch += 1
         start_batch = 0
+    training_progress.close()
     return output_dir / "best.pt"
 
 
@@ -618,6 +628,8 @@ def sample_conditioned_oct(
     saved: list[Path] = []
     metadata: list[dict[str, Any]] = []
 
+    total_sampling_steps = len(selected_ids) * len(view_codes) * samples_per_view * len(scheduler.timesteps)
+    sampling_progress = tqdm(total=total_sampling_steps, desc="Sampling OCT", unit="step")
     for patient_id in selected_ids:
         ehr = ehr_by_patient[patient_id].unsqueeze(0).to(device)
         for view_code in view_codes:
@@ -639,6 +651,7 @@ def sample_conditioned_oct(
                         conditional_prediction - unconditional_prediction
                     )
                     noise, _ = scheduler.step(guided, timestep_value, noise)
+                    sampling_progress.update(1)
                 with autocast_context(device, dtype, amp_enabled):
                     image = autoencoder.decode_stage_2_outputs(noise / scale_factor)
                 output_path = destination / f"eid-{patient_id}_view-{view_code}_sample-{sample_index:03d}.png"
@@ -655,5 +668,6 @@ def sample_conditioned_oct(
                         "seed": seed,
                     }
                 )
+    sampling_progress.close()
     (destination / "samples.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     return saved

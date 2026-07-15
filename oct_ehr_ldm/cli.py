@@ -4,6 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
+from tqdm.auto import tqdm
+
 from .config import load_config
 
 
@@ -65,40 +67,46 @@ def _smoke_test(config, diffusion_checkpoint: str | None) -> dict[str, object]:
     from .data import create_datasets, create_loader, load_manifest
     from .models import EHRConditionProjector, build_cxr_autoencoder, build_cxr_diffusion, load_module_checkpoint
 
-    manifest = load_manifest(config)
-    train, _ = create_datasets(config, manifest)
-    batch = next(iter(create_loader(train, config, training=False)))
-    autoencoder = build_cxr_autoencoder()
-    load_module_checkpoint(
-        autoencoder,
-        config.path("paths.cxr_autoencoder_checkpoint"),
-        preferred_keys=("model", "autoencoder"),
-        strict=True,
-    )
-    diffusion = build_cxr_diffusion()
-    load_module_checkpoint(
-        diffusion,
-        config.path("paths.cxr_diffusion_checkpoint"),
-        preferred_keys=("diffusion", "model"),
-        strict=True,
-    )
-    result: dict[str, object] = {
-        "image_shape": list(batch["image"].shape),
-        "ehr_shape": list(batch["ehr"].shape),
-        "cxr_autoencoder_strict_load": True,
-        "cxr_diffusion_strict_load": True,
-    }
-    if diffusion_checkpoint:
-        from .data import safe_torch_load
+    steps = 4 if diffusion_checkpoint else 3
+    with tqdm(total=steps, desc="Running smoke test", unit="check") as progress:
+        manifest = load_manifest(config)
+        train, _ = create_datasets(config, manifest)
+        batch = next(iter(create_loader(train, config, training=False)))
+        progress.update(1)
+        autoencoder = build_cxr_autoencoder()
+        load_module_checkpoint(
+            autoencoder,
+            config.path("paths.cxr_autoencoder_checkpoint"),
+            preferred_keys=("model", "autoencoder"),
+            strict=True,
+        )
+        progress.update(1)
+        diffusion = build_cxr_diffusion()
+        load_module_checkpoint(
+            diffusion,
+            config.path("paths.cxr_diffusion_checkpoint"),
+            preferred_keys=("diffusion", "model"),
+            strict=True,
+        )
+        progress.update(1)
+        result: dict[str, object] = {
+            "image_shape": list(batch["image"].shape),
+            "ehr_shape": list(batch["ehr"].shape),
+            "cxr_autoencoder_strict_load": True,
+            "cxr_diffusion_strict_load": True,
+        }
+        if diffusion_checkpoint:
+            from .data import safe_torch_load
 
-        checkpoint = safe_torch_load(diffusion_checkpoint)
-        diffusion.load_state_dict(checkpoint["diffusion"], strict=True)
-        projector = EHRConditionProjector(**checkpoint["architecture"])
-        projector.load_state_dict(checkpoint["projector"], strict=True)
-        context = projector.conditional_context(batch["ehr"], batch["view_id"])
-        result["trained_diffusion_strict_load"] = True
-        result["context_shape"] = list(context.shape)
-        result["context_finite"] = bool(torch.isfinite(context).all())
+            checkpoint = safe_torch_load(diffusion_checkpoint)
+            diffusion.load_state_dict(checkpoint["diffusion"], strict=True)
+            projector = EHRConditionProjector(**checkpoint["architecture"])
+            projector.load_state_dict(checkpoint["projector"], strict=True)
+            context = projector.conditional_context(batch["ehr"], batch["view_id"])
+            result["trained_diffusion_strict_load"] = True
+            result["context_shape"] = list(context.shape)
+            result["context_finite"] = bool(torch.isfinite(context).all())
+            progress.update(1)
     return result
 
 
@@ -110,7 +118,12 @@ def main(argv: list[str] | None = None) -> None:
     if args.command in {"prepare-data", "inspect-data"}:
         from .data import load_manifest, prepare_manifest, summarize_manifest
 
-        manifest = prepare_manifest(config) if args.command == "prepare-data" else load_manifest(config, False)
+        if args.command == "prepare-data":
+            manifest = prepare_manifest(config)
+        else:
+            with tqdm(total=1, desc="Inspecting data manifest", unit="manifest") as progress:
+                manifest = load_manifest(config, False)
+                progress.update(1)
         print(json.dumps(summarize_manifest(manifest), indent=2, ensure_ascii=False))
         return
 

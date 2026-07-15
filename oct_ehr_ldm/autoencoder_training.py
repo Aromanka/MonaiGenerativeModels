@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import math
 import time
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from tqdm.auto import tqdm
 
 from .config import ProjectConfig
 from .data import create_datasets, create_loader, load_manifest, safe_torch_load
@@ -52,9 +54,9 @@ def validate_autoencoder(
     absolute_error = 0.0
     squared_error = 0.0
     element_count = 0
-    for batch_index, batch in enumerate(loader):
-        if max_batches is not None and batch_index >= max_batches:
-            break
+    total = max(0, min(len(loader), max_batches)) if max_batches is not None else len(loader)
+    progress = tqdm(islice(loader, total), total=total, desc="Validating autoencoder", unit="batch", leave=False)
+    for batch in progress:
         images = batch["image"].to(device, non_blocking=True)
         with autocast_context(device, dtype, amp_enabled):
             reconstruction = model.reconstruct(images)
@@ -164,13 +166,15 @@ def train_autoencoder(config: ProjectConfig, resume: str | Path | None = None) -
     max_val_batches = int(max_val_batches) if max_val_batches is not None else None
     started = time.time()
 
-    for epoch in range(start_epoch, epochs):
+    epochs_progress = tqdm(range(start_epoch, epochs), desc="Training autoencoder", unit="epoch")
+    for epoch in epochs_progress:
         model.train()
         loader = create_loader(train_dataset, config, training=True, epoch=epoch)
         optimizer.zero_grad(set_to_none=True)
         totals = {"loss": 0.0, "l1": 0.0, "kl": 0.0, "perceptual": 0.0}
         batch_count = 0
-        for batch_index, batch in enumerate(loader):
+        batches_progress = tqdm(loader, desc=f"Epoch {epoch + 1}/{epochs}", unit="batch", leave=False)
+        for batch_index, batch in enumerate(batches_progress):
             images = batch["image"].to(device, non_blocking=True)
             with autocast_context(device, dtype, amp_enabled):
                 reconstruction, mu, sigma = model(images)
@@ -201,6 +205,7 @@ def train_autoencoder(config: ProjectConfig, resume: str | Path | None = None) -
             totals["l1"] += l1.item()
             totals["kl"] += kl.item()
             totals["perceptual"] += p_loss.item()
+            batches_progress.set_postfix(loss=f"{loss.item():.4f}", step=global_step)
 
         validation = validate_autoencoder(
             model, val_loader, device, dtype, amp_enabled, max_batches=max_val_batches
@@ -221,6 +226,7 @@ def train_autoencoder(config: ProjectConfig, resume: str | Path | None = None) -
         }
         append_jsonl(metrics_path, row)
         print(json.dumps(row, ensure_ascii=False))
+        epochs_progress.set_postfix(train=f"{row['train_loss']:.4f}", val=f"{validation['mae']:.4f}")
         best_val = min(best_val, validation["mae"])
         payload = _autoencoder_payload(
             model, optimizer, lr_scheduler, scaler, epoch + 1, global_step, best_val, config, manifest
@@ -256,7 +262,16 @@ def evaluate_autoencoder(
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     panel_count = 0
-    for batch in val_loader:
+    panel_batches = math.ceil(max_panels / max(1, val_loader.batch_size or 1))
+    panel_total = min(len(val_loader), panel_batches)
+    panel_progress = tqdm(
+        islice(val_loader, panel_total),
+        total=panel_total,
+        desc="Saving reconstruction panels",
+        unit="batch",
+        leave=False,
+    )
+    for batch in panel_progress:
         images = batch["image"].to(device, non_blocking=True)
         with autocast_context(device, dtype, amp_enabled):
             reconstructions = model.reconstruct(images)

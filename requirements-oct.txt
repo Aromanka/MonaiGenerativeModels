@@ -1,5 +1,6 @@
 # Extra dependencies for the EHR-conditioned OCT fine-tuning project.
 Pillow>=9.0
 lpips>=0.1.4
+tqdm>=4.47.0
 # Matches the recommended torch==2.2.2 environment used for this archived repository.
 torchvision==0.17.2
