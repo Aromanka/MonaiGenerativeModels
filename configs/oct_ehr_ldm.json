@@ -18,7 +18,7 @@
     "val_fraction": 0.1,
     "split_seed": 2026,
     "fail_missing_images": true,
-    "batch_size": 2,
+    "batch_size": 4,
     "num_workers": 4,
     "prefetch_factor": 2,
     "intensity_augmentation": 0.03
@@ -33,8 +33,8 @@
     "log_every_steps": 20
   },
   "autoencoder": {
-    "epochs": 20,
-    "learning_rate": 0.00001,
+    "epochs": 1,
+    "learning_rate": 0.0001,
     "weight_decay": 0.01,
     "kl_weight": 0.000001,
     "perceptual_weight": 0.001,
