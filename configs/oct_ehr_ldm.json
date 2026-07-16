@@ -18,7 +18,7 @@
     "val_fraction": 0.1,
     "split_seed": 2026,
     "fail_missing_images": true,
-    "batch_size": 32,
+    "batch_size": 16,
     "num_workers": 4,
     "prefetch_factor": 2,
     "intensity_augmentation": 0.03
