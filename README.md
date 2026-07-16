@@ -279,7 +279,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
 python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
   evaluate-diffusion \
   --checkpoint outputs/diffusion_alignment/best.pt \
-  --max-batches 20
+  --max-batches 4
 ```
 
 报告三种固定噪声下的 v-prediction loss：
