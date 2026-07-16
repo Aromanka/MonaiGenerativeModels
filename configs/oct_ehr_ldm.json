@@ -28,13 +28,13 @@
     "device": "cuda",
     "precision": "auto",
     "gradient_clip_norm": 1.0,
-    "warmup_fraction": 0.03,
-    "log_every_steps": 20
+    "warmup_fraction": 0.03
   },
   "autoencoder": {
     "batch_size": 4,
     "gradient_accumulation_steps": 4,
     "max_epochs": 1,
+    "log_every_steps": 20,
     "learning_rate": 0.0001,
     "weight_decay": 0.01,
     "kl_weight": 0.000001,
@@ -59,6 +59,7 @@
       "batch_size": 16,
       "gradient_accumulation_steps": 1,
       "max_epochs": 30,
+      "log_every_steps": 100,
       "unet_learning_rate": 0.0001,
       "projector_learning_rate": 0.0001,
       "weight_decay": 0.01,
@@ -69,6 +70,7 @@
       "batch_size": 2,
       "gradient_accumulation_steps": 4,
       "max_epochs": 150,
+      "log_every_steps": 20,
       "unet_learning_rate": 0.00001,
       "projector_learning_rate": 0.00005,
       "weight_decay": 0.01,

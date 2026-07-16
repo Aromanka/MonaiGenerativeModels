@@ -118,6 +118,9 @@ model-zoo/models/cxr_image_synthesis_latent_diffusion_model/models/diffusion_mod
 同一阶段的 `--resume` 必须沿用创建 checkpoint 时的 GPU 数量。
 三个训练阶段均按 epoch 结束训练，分别由 `autoencoder.max_epochs`、
 `diffusion.alignment.max_epochs` 和 `diffusion.full.max_epochs` 控制，不再使用 `max_steps` 作为终止条件。
+TQDM 进度条、训练日志、验证和定期保存仍以 optimizer step 为单位；三个阶段的日志间隔分别由
+`autoencoder.log_every_steps`、`diffusion.alignment.log_every_steps` 和
+`diffusion.full.log_every_steps` 独立控制。
 旧版 checkpoint 没有 `world_size` 字段，会按单卡 checkpoint 处理，不能直接用四卡 `--resume`；但模型权重
 仍可用于评估，alignment 的 `best.pt` 也仍可通过 `--init-checkpoint` 初始化 full 阶段。
 
@@ -179,7 +182,7 @@ original | reconstruction | absolute error
 
 本阶段每卡 batch size 由 `autoencoder.batch_size` 控制，默认值为 4；梯度累积由
 `autoencoder.gradient_accumulation_steps` 控制，默认值为 4；训练轮数由 `autoencoder.max_epochs`
-控制，默认值为 1。
+控制，默认值为 1；日志间隔由 `autoencoder.log_every_steps` 控制，默认每 20 step 记录一次。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
@@ -226,7 +229,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
 
 本阶段每卡 batch size 由 `diffusion.alignment.batch_size` 控制，默认值为 16；梯度累积由
 `diffusion.alignment.gradient_accumulation_steps` 控制，默认值为 1；训练轮数由
-`diffusion.alignment.max_epochs` 控制，默认值为 30。
+`diffusion.alignment.max_epochs` 控制，默认值为 30；日志间隔由
+`diffusion.alignment.log_every_steps` 控制，默认每 20 step 记录一次。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
@@ -291,7 +295,8 @@ python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
 
 本阶段每卡 batch size 由 `diffusion.full.batch_size` 控制，默认值为 2；梯度累积由
 `diffusion.full.gradient_accumulation_steps` 控制，默认值为 4；训练轮数由
-`diffusion.full.max_epochs` 控制，默认值为 150。
+`diffusion.full.max_epochs` 控制，默认值为 150；日志间隔由
+`diffusion.full.log_every_steps` 控制，默认每 20 step 记录一次。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
@@ -380,6 +385,9 @@ python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
 | Autoencoder epochs | 1 |
 | alignment epochs | 30 |
 | full epochs | 150 |
+| Autoencoder log interval | 20 steps |
+| alignment log interval | 20 steps |
+| full log interval | 20 steps |
 | EMA | 0.9999 |
 | gradient clip | 1.0 |
 

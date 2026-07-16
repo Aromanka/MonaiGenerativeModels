@@ -230,6 +230,10 @@ def train_autoencoder(
     metrics_path = output_dir / "metrics.jsonl"
     kl_weight = float(config.get("autoencoder.kl_weight", 1e-6))
     clip_norm = float(config.get("training.gradient_clip_norm", 1.0))
+    log_every = max(
+        1,
+        int(config.get("autoencoder.log_every_steps", config.get("training.log_every_steps", 20))),
+    )
     max_val_batches = config.get("autoencoder.max_val_batches")
     max_val_batches = int(max_val_batches) if max_val_batches is not None else None
     started = time.time()
@@ -243,16 +247,23 @@ def train_autoencoder(
                     "per_device_batch": stage_batch_size,
                     "gradient_accumulation": accumulation,
                     "effective_batch": stage_batch_size * accumulation * context.world_size,
+                    "max_epochs": epochs,
+                    "optimizer_steps_per_epoch": steps_per_epoch,
+                    "planned_optimizer_steps": total_steps,
+                    "log_every_steps": log_every,
                 }
             )
         )
-    epochs_progress = tqdm(
-        range(start_epoch, epochs),
+    training_progress = tqdm(
+        total=total_steps,
+        initial=global_step,
         desc="Training autoencoder",
-        unit="epoch",
+        unit="step",
         disable=not context.is_main_process,
     )
-    for epoch in epochs_progress:
+    running = {"loss": 0.0, "l1": 0.0, "kl": 0.0, "perceptual": 0.0}
+    running_batches = 0
+    for epoch in range(start_epoch, epochs):
         train_model.train()
         loader = create_loader(
             train_dataset,
@@ -265,14 +276,7 @@ def train_autoencoder(
         optimizer.zero_grad(set_to_none=True)
         totals = {"loss": 0.0, "l1": 0.0, "kl": 0.0, "perceptual": 0.0}
         batch_count = 0
-        batches_progress = tqdm(
-            loader,
-            desc=f"Epoch {epoch + 1}/{epochs}",
-            unit="batch",
-            leave=False,
-            disable=not context.is_main_process,
-        )
-        for batch_index, batch in enumerate(batches_progress):
+        for batch_index, batch in enumerate(loader):
             images = batch["image"].to(device, non_blocking=True)
             should_step = (batch_index + 1) % accumulation == 0 or batch_index + 1 == len(loader)
             with ddp_sync_context((train_model,), should_step):
@@ -291,6 +295,16 @@ def train_autoencoder(
                         f"Non-finite Autoencoder loss at epoch {epoch}, batch {batch_index}: {loss.item()}"
                     )
                 scaler.scale(loss / accumulation).backward()
+            batch_count += 1
+            totals["loss"] += loss.item()
+            totals["l1"] += l1.item()
+            totals["kl"] += kl.item()
+            totals["perceptual"] += p_loss.item()
+            running["loss"] += loss.item()
+            running["l1"] += l1.item()
+            running["kl"] += kl.item()
+            running["perceptual"] += p_loss.item()
+            running_batches += 1
             if should_step:
                 scaler.unscale_(optimizer)
                 gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
@@ -301,12 +315,41 @@ def train_autoencoder(
                 optimizer.zero_grad(set_to_none=True)
                 lr_scheduler.step()
                 global_step += 1
-            batch_count += 1
-            totals["loss"] += loss.item()
-            totals["l1"] += l1.item()
-            totals["kl"] += kl.item()
-            totals["perceptual"] += p_loss.item()
-            batches_progress.set_postfix(loss=f"{loss.item():.4f}", step=global_step)
+                training_progress.update(1)
+                training_progress.set_postfix(loss=f"{loss.item():.4f}", epoch=epoch + 1)
+                final_update = epoch + 1 >= epochs and batch_index + 1 >= len(loader)
+                if global_step % log_every == 0 or final_update:
+                    log_statistics = torch.tensor(
+                        [
+                            running["loss"],
+                            running["l1"],
+                            running["kl"],
+                            running["perceptual"],
+                            running_batches,
+                        ],
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                    all_reduce_sum(log_statistics, context)
+                    log_loss, log_l1, log_kl, log_perceptual, log_batches = log_statistics.tolist()
+                    log_row = {
+                        "stage": "autoencoder",
+                        "event": "train",
+                        "epoch": epoch + 1,
+                        "global_step": global_step,
+                        "train_loss": log_loss / max(1, log_batches),
+                        "train_l1": log_l1 / max(1, log_batches),
+                        "train_kl": log_kl / max(1, log_batches),
+                        "train_perceptual": log_perceptual / max(1, log_batches),
+                        "gradient_norm": float(gradient_norm),
+                        "lr": optimizer.param_groups[0]["lr"],
+                        "elapsed_seconds": time.time() - started,
+                    }
+                    if context.is_main_process:
+                        append_jsonl(metrics_path, log_row)
+                        print(json.dumps(log_row, ensure_ascii=False))
+                    running = {"loss": 0.0, "l1": 0.0, "kl": 0.0, "perceptual": 0.0}
+                    running_batches = 0
 
         validation = validate_autoencoder(
             model,
@@ -326,6 +369,7 @@ def train_autoencoder(
         train_loss, train_l1, train_kl, train_perceptual, global_batch_count = train_statistics.tolist()
         row = {
             "stage": "autoencoder",
+            "event": "validation",
             "epoch": epoch + 1,
             "global_step": global_step,
             "lr": optimizer.param_groups[0]["lr"],
@@ -341,7 +385,9 @@ def train_autoencoder(
         if context.is_main_process:
             append_jsonl(metrics_path, row)
             print(json.dumps(row, ensure_ascii=False))
-        epochs_progress.set_postfix(train=f"{row['train_loss']:.4f}", val=f"{validation['mae']:.4f}")
+        training_progress.set_postfix(
+            train=f"{row['train_loss']:.4f}", val=f"{validation['mae']:.4f}", epoch=epoch + 1
+        )
         is_best = validation["mae"] < best_val
         best_val = min(best_val, validation["mae"])
         rng_states = gather_rng_states(context)
@@ -363,6 +409,7 @@ def train_autoencoder(
             if is_best:
                 atomic_torch_save(payload, output_dir / "best.pt")
         context.barrier()
+    training_progress.close()
     return output_dir / "best.pt"
 
 

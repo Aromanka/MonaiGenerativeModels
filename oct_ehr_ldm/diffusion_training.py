@@ -398,6 +398,10 @@ def train_diffusion(
     max_epochs = int(config.get(f"{phase_config}.max_epochs", 30 if phase == "alignment" else 150))
     if max_epochs <= 0:
         raise ValueError(f"{phase_config}.max_epochs must be positive")
+    log_every = max(
+        1,
+        int(config.get(f"{phase_config}.log_every_steps", config.get("training.log_every_steps", 20))),
+    )
     schedule_loader = create_loader(
         train_dataset,
         config,
@@ -421,6 +425,7 @@ def train_diffusion(
                     "max_epochs": max_epochs,
                     "optimizer_steps_per_epoch": steps_per_epoch,
                     "planned_optimizer_steps": total_steps,
+                    "log_every_steps": log_every,
                     "diffusion_trainable_parameters": count_parameters(diffusion, trainable_only=True),
                     "diffusion_total_parameters": count_parameters(diffusion),
                     "projector_parameters": count_parameters(projector),
@@ -517,7 +522,6 @@ def train_diffusion(
         raise ValueError("condition.dropout_probability must be in [0, 1)")
     validate_every = max(1, int(config.get(f"{phase_config}.validate_every_steps", 1000)))
     save_every = max(1, int(config.get(f"{phase_config}.save_every_steps", 1000)))
-    log_every = max(1, int(config.get("training.log_every_steps", 20)))
     max_val_batches = int(config.get("diffusion.max_val_batches", 20))
     started = time.time()
     epoch = start_epoch
@@ -525,10 +529,10 @@ def train_diffusion(
     running_batches = 0
 
     training_progress = tqdm(
-        total=max_epochs,
-        initial=start_epoch,
+        total=total_steps,
+        initial=global_step,
         desc=f"Training diffusion ({phase})",
-        unit="epoch",
+        unit="step",
         disable=not context.is_main_process,
     )
     while epoch < max_epochs:
@@ -581,6 +585,7 @@ def train_diffusion(
             optimizer.zero_grad(set_to_none=True)
             lr_scheduler.step()
             global_step += 1
+            training_progress.update(1)
             training_progress.set_postfix(loss=f"{loss.item():.4f}", step=global_step)
             if ema is not None:
                 ema.update({"diffusion": diffusion, "projector": projector})
@@ -590,7 +595,7 @@ def train_diffusion(
             if next_batch >= len(loader):
                 next_epoch, next_batch = epoch + 1, 0
             final_update = next_epoch >= max_epochs
-            if global_step % log_every == 0:
+            if global_step % log_every == 0 or final_update:
                 log_statistics = torch.tensor(
                     [running_loss, running_batches], device=device, dtype=torch.float64
                 )
@@ -667,7 +672,6 @@ def train_diffusion(
                 context.barrier()
         epoch += 1
         start_batch = 0
-        training_progress.update(1)
     training_progress.close()
     return output_dir / "best.pt"
 
