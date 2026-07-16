@@ -155,8 +155,26 @@ def train_autoencoder(
         weight_decay=float(config.get("autoencoder.weight_decay", 0.01)),
     )
     epochs = int(config.get("autoencoder.epochs", 20))
-    accumulation = max(1, int(config.get("training.gradient_accumulation_steps", 1)))
-    schedule_loader = create_loader(train_dataset, config, training=True, epoch=0, distributed=context)
+    stage_batch_size = int(config.get("autoencoder.batch_size", config.get("data.batch_size", 4)))
+    if stage_batch_size <= 0:
+        raise ValueError("autoencoder.batch_size must be positive")
+    accumulation = max(
+        1,
+        int(
+            config.get(
+                "autoencoder.gradient_accumulation_steps",
+                config.get("training.gradient_accumulation_steps", 1),
+            )
+        ),
+    )
+    schedule_loader = create_loader(
+        train_dataset,
+        config,
+        training=True,
+        epoch=0,
+        distributed=context,
+        batch_size=stage_batch_size,
+    )
     steps_per_epoch = max(1, math.ceil(len(schedule_loader) / accumulation))
     total_steps = epochs * steps_per_epoch
     warmup_steps = int(total_steps * float(config.get("training.warmup_fraction", 0.03)))
@@ -220,11 +238,9 @@ def train_autoencoder(
                 {
                     "distributed": context.distributed,
                     "world_size": context.world_size,
-                    "per_device_batch": int(config.get("data.batch_size", 4)),
+                    "per_device_batch": stage_batch_size,
                     "gradient_accumulation": accumulation,
-                    "effective_batch": int(config.get("data.batch_size", 4))
-                    * accumulation
-                    * context.world_size,
+                    "effective_batch": stage_batch_size * accumulation * context.world_size,
                 }
             )
         )
@@ -236,7 +252,14 @@ def train_autoencoder(
     )
     for epoch in epochs_progress:
         train_model.train()
-        loader = create_loader(train_dataset, config, training=True, epoch=epoch, distributed=context)
+        loader = create_loader(
+            train_dataset,
+            config,
+            training=True,
+            epoch=epoch,
+            distributed=context,
+            batch_size=stage_batch_size,
+        )
         optimizer.zero_grad(set_to_none=True)
         totals = {"loss": 0.0, "l1": 0.0, "kl": 0.0, "perceptual": 0.0}
         batch_count = 0

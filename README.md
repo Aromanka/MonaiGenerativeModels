@@ -109,10 +109,13 @@ model-zoo/models/cxr_image_synthesis_latent_diffusion_model/models/diffusion_mod
 
 所有命令都从仓库根目录运行。全局 `--config` 要放在子命令之前。
 
-训练命令默认使用 `cuda:0,1,2,3`，通过 PyTorch DDP 启动四个进程。`data.batch_size` 表示每张 GPU
-的 batch size；默认有效 batch 为 `2 × 4（梯度累积）× 4（GPU）= 32`。准备数据、检查、评估和采样
-仍使用普通的单进程命令。如果需要改变 GPU 数量，应同时修改 `CUDA_VISIBLE_DEVICES` 和
-`--nproc_per_node`；同一阶段的 `--resume` 必须沿用创建 checkpoint 时的 GPU 数量。
+训练命令默认使用 `cuda:0,1,2,3`，通过 PyTorch DDP 启动四个进程。三个训练阶段分别由
+`autoencoder.batch_size`、`diffusion.alignment.batch_size` 和 `diffusion.full.batch_size` 控制每张 GPU
+的 batch size，并由对应的 `autoencoder.gradient_accumulation_steps`、
+`diffusion.alignment.gradient_accumulation_steps` 和 `diffusion.full.gradient_accumulation_steps`
+控制梯度累积；验证和独立评估使用 `data.eval_batch_size`。准备数据、检查、评估和采样仍使用普通的
+单进程命令。如果需要改变 GPU 数量，应同时修改 `CUDA_VISIBLE_DEVICES` 和 `--nproc_per_node`；
+同一阶段的 `--resume` 必须沿用创建 checkpoint 时的 GPU 数量。
 旧版 checkpoint 没有 `world_size` 字段，会按单卡 checkpoint 处理，不能直接用四卡 `--resume`；但模型权重
 仍可用于评估，alignment 的 `best.pt` 也仍可通过 `--init-checkpoint` 初始化 full 阶段。
 
@@ -172,6 +175,9 @@ original | reconstruction | absolute error
 
 ### 4. Stage 1：OCT Autoencoder domain adaptation
 
+本阶段每卡 batch size 由 `autoencoder.batch_size` 控制，默认值为 4；梯度累积由
+`autoencoder.gradient_accumulation_steps` 控制，默认值为 4。
+
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
   --standalone \
@@ -214,6 +220,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
 ```
 
 ### 5. Stage 2：EHR condition alignment
+
+本阶段每卡 batch size 由 `diffusion.alignment.batch_size` 控制，默认值为 4；梯度累积由
+`diffusion.alignment.gradient_accumulation_steps` 控制，默认值为 4。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
@@ -275,6 +284,9 @@ python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
 理想情况下 `condition_gap > 0`。它不是最终图像质量指标，但能发现 projector/condition 被完全忽略的问题。若 val 只有一位患者，无法定义可靠的 shuffled 指标，应增大 val split。
 
 ### 7. Stage 3：完整 Diffusion U-Net 微调
+
+本阶段每卡 batch size 由 `diffusion.full.batch_size` 控制，默认值为 2；梯度累积由
+`diffusion.full.gradient_accumulation_steps` 控制，默认值为 4。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
@@ -348,9 +360,15 @@ python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
 | resolution | 512×512 |
 | GPU | cuda:0,1,2,3 |
 | world size | 4 |
-| device batch（每卡） | 2 |
-| gradient accumulation | 4 |
-| effective batch | 32 |
+| Autoencoder batch（每卡） | 4 |
+| alignment batch（每卡） | 4 |
+| full batch（每卡） | 2 |
+| eval batch | 4 |
+| Autoencoder gradient accumulation | 4 |
+| alignment gradient accumulation | 4 |
+| full gradient accumulation | 4 |
+| Autoencoder/alignment effective batch | 64 |
+| full effective batch | 32 |
 | precision | 自动选择 BF16，否则 FP16 |
 | condition tokens | 8×1024 |
 | condition dropout | 0.1 |
@@ -361,8 +379,8 @@ python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
 
 单卡显存不足时按顺序调整：
 
-1. `data.batch_size: 2 -> 1`；
-2. 相应增大 `gradient_accumulation_steps`，维持多卡 effective batch；
+1. 只降低当前阶段的 batch，例如 `diffusion.full.batch_size: 2 -> 1`；
+2. 相应增大当前阶段的累积步数，例如 `diffusion.full.gradient_accumulation_steps: 4 -> 8`，维持多卡 effective batch；
 3. `autoencoder.activation_checkpointing: true`（仅影响 Autoencoder 阶段）；
 4. 缩短验证 batch 数或降低 DataLoader workers 不会显著降低训练显存，但可减少主机内存/I/O 压力。
 

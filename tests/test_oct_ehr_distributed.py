@@ -67,6 +67,11 @@ class TestDistributedDataLoading(unittest.TestCase):
         self.assertFalse(shards[0] & shards[2])
         self.assertFalse(shards[1] & shards[2])
 
+    def test_loader_accepts_stage_specific_batch_size(self) -> None:
+        loader = create_loader(self.dataset, self.config, training=True, batch_size=3)
+        self.assertEqual(loader.batch_size, 3)
+        self.assertTrue(loader.drop_last)
+
 
 def _assert_ddp_operations(context: DistributedContext) -> None:
     model = torch.nn.Linear(1, 1, bias=False)

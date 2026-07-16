@@ -18,7 +18,7 @@
     "val_fraction": 0.1,
     "split_seed": 2026,
     "fail_missing_images": true,
-    "batch_size": 4,
+    "eval_batch_size": 4,
     "num_workers": 4,
     "prefetch_factor": 2,
     "intensity_augmentation": 0.03
@@ -27,12 +27,13 @@
     "seed": 2026,
     "device": "cuda",
     "precision": "auto",
-    "gradient_accumulation_steps": 4,
     "gradient_clip_norm": 1.0,
     "warmup_fraction": 0.03,
     "log_every_steps": 20
   },
   "autoencoder": {
+    "batch_size": 4,
+    "gradient_accumulation_steps": 4,
     "epochs": 1,
     "learning_rate": 0.0001,
     "weight_decay": 0.01,
@@ -55,14 +56,18 @@
     "use_ema_for_phase_init": true,
     "max_val_batches": 20,
     "alignment": {
+      "batch_size": 16,
+      "gradient_accumulation_steps": 1,
       "max_steps": 10000,
-      "unet_learning_rate": 0.00001,
+      "unet_learning_rate": 0.0001,
       "projector_learning_rate": 0.0001,
       "weight_decay": 0.01,
       "validate_every_steps": 500,
       "save_every_steps": 500
     },
     "full": {
+      "batch_size": 2,
+      "gradient_accumulation_steps": 4,
       "max_steps": 100000,
       "unet_learning_rate": 0.00001,
       "projector_learning_rate": 0.00005,

@@ -382,6 +382,19 @@ def train_diffusion(
     trainable_names = configure_diffusion_phase(diffusion, phase)
     for parameter in projector.parameters():
         parameter.requires_grad = True
+    phase_config = f"diffusion.{phase}"
+    stage_batch_size = int(config.get(f"{phase_config}.batch_size", config.get("data.batch_size", 4)))
+    if stage_batch_size <= 0:
+        raise ValueError(f"{phase_config}.batch_size must be positive")
+    stage_accumulation = max(
+        1,
+        int(
+            config.get(
+                f"{phase_config}.gradient_accumulation_steps",
+                config.get("training.gradient_accumulation_steps", 1),
+            )
+        ),
+    )
     if context.is_main_process:
         print(
             json.dumps(
@@ -389,6 +402,9 @@ def train_diffusion(
                     "phase": phase,
                     "distributed": context.distributed,
                     "world_size": context.world_size,
+                    "per_device_batch": stage_batch_size,
+                    "gradient_accumulation": stage_accumulation,
+                    "effective_batch": stage_batch_size * stage_accumulation * context.world_size,
                     "diffusion_trainable_parameters": count_parameters(diffusion, trainable_only=True),
                     "diffusion_total_parameters": count_parameters(diffusion),
                     "projector_parameters": count_parameters(projector),
@@ -397,7 +413,6 @@ def train_diffusion(
             )
         )
 
-    phase_config = f"diffusion.{phase}"
     unet_lr = float(config.get(f"{phase_config}.unet_learning_rate", 1e-5))
     projector_lr = float(config.get(f"{phase_config}.projector_learning_rate", 1e-4))
     parameter_groups = [
@@ -480,7 +495,7 @@ def train_diffusion(
         output_dir.mkdir(parents=True, exist_ok=True)
     context.barrier()
     metrics_path = output_dir / "metrics.jsonl"
-    accumulation = max(1, int(config.get("training.gradient_accumulation_steps", 1)))
+    accumulation = stage_accumulation
     clip_norm = float(config.get("training.gradient_clip_norm", 1.0))
     condition_dropout = float(config.get("condition.dropout_probability", 0.1))
     if not 0 <= condition_dropout < 1:
@@ -502,7 +517,14 @@ def train_diffusion(
         disable=not context.is_main_process,
     )
     while global_step < max_steps:
-        loader = create_loader(train_dataset, config, training=True, epoch=epoch, distributed=context)
+        loader = create_loader(
+            train_dataset,
+            config,
+            training=True,
+            epoch=epoch,
+            distributed=context,
+            batch_size=stage_batch_size,
+        )
         train_diffusion_model.train()
         train_projector_model.train()
         autoencoder.eval()

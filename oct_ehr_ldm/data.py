@@ -329,8 +329,16 @@ def create_loader(
     training: bool,
     epoch: int = 0,
     distributed: DistributedContext | None = None,
+    batch_size: int | None = None,
 ) -> DataLoader:
     workers = int(config.get("data.num_workers", 4))
+    resolved_batch_size = int(
+        batch_size
+        if batch_size is not None
+        else config.get("data.eval_batch_size", config.get("data.batch_size", 4))
+    )
+    if resolved_batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {resolved_batch_size}")
     seed = int(config.get("training.seed", 2026))
     rank = distributed.rank if distributed is not None else 0
     generator = torch.Generator().manual_seed(seed + epoch + rank * 1_000_003)
@@ -351,14 +359,14 @@ def create_loader(
             sampler = DistributedEvalSampler(dataset, distributed.rank, distributed.world_size)
     return DataLoader(
         dataset,
-        batch_size=int(config.get("data.batch_size", 4)),
+        batch_size=resolved_batch_size,
         shuffle=training and sampler is None,
         sampler=sampler,
         num_workers=workers,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=workers > 0,
         prefetch_factor=int(config.get("data.prefetch_factor", 2)) if workers > 0 else None,
-        drop_last=training and len(dataset) >= int(config.get("data.batch_size", 4)),
+        drop_last=training and len(dataset) >= resolved_batch_size,
         generator=generator,
     )
 
