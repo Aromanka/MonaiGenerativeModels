@@ -7,15 +7,17 @@ import random
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import numpy as np
 import torch
 from PIL import Image, ImageOps
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 from .config import ProjectConfig
+from .runtime import DistributedContext, is_main_process
 
 
 VIEW_PATTERN = re.compile(r"^(?P<eid>\d+)_(?P<field_id>\d+)_(?P<instance>\d+)_(?P<array>\d+)_")
@@ -68,7 +70,9 @@ def load_ehr_dictionary(path: str | Path) -> dict[int, torch.Tensor]:
         raise TypeError(f"Expected a pure patient->latent dictionary in {path}; got {type(raw)!r}")
     normalized: dict[int, torch.Tensor] = {}
     expected_dim: int | None = None
-    for raw_id, raw_latent in tqdm(raw.items(), desc="Loading EHR latents", unit="patient"):
+    for raw_id, raw_latent in tqdm(
+        raw.items(), desc="Loading EHR latents", unit="patient", disable=not is_main_process()
+    ):
         patient_id = normalize_patient_id(raw_id)
         if patient_id in normalized:
             raise ValueError(f"Duplicate normalized patient ID {patient_id} in {path}")
@@ -91,7 +95,9 @@ def load_oct_index(path: str | Path) -> dict[int, list[str]]:
     if not isinstance(raw, dict):
         raise TypeError(f"OCT index must be a JSON object: {path}")
     normalized: dict[int, list[str]] = {}
-    for raw_id, raw_paths in tqdm(raw.items(), desc="Loading OCT index", unit="patient"):
+    for raw_id, raw_paths in tqdm(
+        raw.items(), desc="Loading OCT index", unit="patient", disable=not is_main_process()
+    ):
         patient_id = normalize_patient_id(raw_id)
         if isinstance(raw_paths, str):
             paths = [raw_paths]
@@ -116,7 +122,9 @@ def build_records(
     records: list[OCTRecord] = []
     missing: list[str] = []
     paired_patient_ids = sorted(ehr_by_patient.keys() & oct_by_patient.keys())
-    for patient_id in tqdm(paired_patient_ids, desc="Validating paired OCT", unit="patient"):
+    for patient_id in tqdm(
+        paired_patient_ids, desc="Validating paired OCT", unit="patient", disable=not is_main_process()
+    ):
         for raw_path in oct_by_patient[patient_id]:
             image_path = str(Path(raw_path).expanduser())
             if not Path(image_path).is_file():
@@ -298,18 +306,54 @@ def create_datasets(config: ProjectConfig, manifest: dict[str, Any]) -> tuple[Pa
     return train, val
 
 
+class DistributedEvalSampler(Sampler[int]):
+    """Shard evaluation data without the duplicate padding used by DistributedSampler."""
+
+    def __init__(self, dataset: Dataset, rank: int, world_size: int) -> None:
+        self.dataset = dataset
+        self.rank = rank
+        self.world_size = world_size
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self) -> int:
+        if self.rank >= len(self.dataset):
+            return 0
+        return (len(self.dataset) - 1 - self.rank) // self.world_size + 1
+
+
 def create_loader(
     dataset: Dataset,
     config: ProjectConfig,
     training: bool,
     epoch: int = 0,
+    distributed: DistributedContext | None = None,
 ) -> DataLoader:
     workers = int(config.get("data.num_workers", 4))
-    generator = torch.Generator().manual_seed(int(config.get("training.seed", 2026)) + epoch)
+    seed = int(config.get("training.seed", 2026))
+    rank = distributed.rank if distributed is not None else 0
+    generator = torch.Generator().manual_seed(seed + epoch + rank * 1_000_003)
+    sampler: Sampler[int] | None = None
+    if distributed is not None and distributed.distributed:
+        if training:
+            train_sampler = DistributedSampler(
+                dataset,
+                num_replicas=distributed.world_size,
+                rank=distributed.rank,
+                shuffle=True,
+                seed=seed,
+                drop_last=False,
+            )
+            train_sampler.set_epoch(epoch)
+            sampler = train_sampler
+        else:
+            sampler = DistributedEvalSampler(dataset, distributed.rank, distributed.world_size)
     return DataLoader(
         dataset,
         batch_size=int(config.get("data.batch_size", 4)),
-        shuffle=training,
+        shuffle=training and sampler is None,
+        sampler=sampler,
         num_workers=workers,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=workers > 0,

@@ -109,6 +109,13 @@ model-zoo/models/cxr_image_synthesis_latent_diffusion_model/models/diffusion_mod
 
 所有命令都从仓库根目录运行。全局 `--config` 要放在子命令之前。
 
+训练命令默认使用 `cuda:0,1,2,3`，通过 PyTorch DDP 启动四个进程。`data.batch_size` 表示每张 GPU
+的 batch size；默认有效 batch 为 `2 × 4（梯度累积）× 4（GPU）= 32`。准备数据、检查、评估和采样
+仍使用普通的单进程命令。如果需要改变 GPU 数量，应同时修改 `CUDA_VISIBLE_DEVICES` 和
+`--nproc_per_node`；同一阶段的 `--resume` 必须沿用创建 checkpoint 时的 GPU 数量。
+旧版 checkpoint 没有 `world_size` 字段，会按单卡 checkpoint 处理，不能直接用四卡 `--resume`；但模型权重
+仍可用于评估，alignment 的 `best.pt` 也仍可通过 `--init-checkpoint` 初始化 full 阶段。
+
 ### 1. 校验数据并固化患者级 split
 
 ```bash
@@ -166,7 +173,12 @@ original | reconstruction | absolute error
 ### 4. Stage 1：OCT Autoencoder domain adaptation
 
 ```bash
-python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json train-autoencoder
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
+  --standalone \
+  --nproc_per_node=4 \
+  -m oct_ehr_ldm \
+  --config configs/oct_ehr_ldm.json \
+  train-autoencoder
 ```
 
 输出：
@@ -192,14 +204,23 @@ python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
 恢复 Autoencoder：
 
 ```bash
-python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
-  train-autoencoder --resume outputs/autoencoder/last.pt
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
+  --standalone \
+  --nproc_per_node=4 \
+  -m oct_ehr_ldm \
+  --config configs/oct_ehr_ldm.json \
+  train-autoencoder \
+  --resume outputs/autoencoder/last.pt
 ```
 
 ### 5. Stage 2：EHR condition alignment
 
 ```bash
-python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
+  --standalone \
+  --nproc_per_node=4 \
+  -m oct_ehr_ldm \
+  --config configs/oct_ehr_ldm.json \
   train-diffusion --phase alignment
 ```
 
@@ -226,7 +247,11 @@ outputs/diffusion_alignment/metrics.jsonl
 恢复同一阶段：
 
 ```bash
-python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
+  --standalone \
+  --nproc_per_node=4 \
+  -m oct_ehr_ldm \
+  --config configs/oct_ehr_ldm.json \
   train-diffusion --phase alignment \
   --resume outputs/diffusion_alignment/last.pt
 ```
@@ -252,7 +277,11 @@ python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
 ### 7. Stage 3：完整 Diffusion U-Net 微调
 
 ```bash
-python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
+  --standalone \
+  --nproc_per_node=4 \
+  -m oct_ehr_ldm \
+  --config configs/oct_ehr_ldm.json \
   train-diffusion --phase full \
   --init-checkpoint outputs/diffusion_alignment/best.pt
 ```
@@ -260,7 +289,11 @@ python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
 这是一个新阶段：默认把 alignment checkpoint 的 EMA diffusion/projector 权重作为初始化，然后训练完整 U-Net 与 projector。不要把 `--init-checkpoint` 当作恢复；中断后应改用：
 
 ```bash
-python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
+  --standalone \
+  --nproc_per_node=4 \
+  -m oct_ehr_ldm \
+  --config configs/oct_ehr_ldm.json \
   train-diffusion --phase full \
   --resume outputs/diffusion_full/last.pt
 ```
@@ -308,13 +341,16 @@ python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
 
 ## 默认训练参数与显存
 
-默认值面向单张 24 GB GPU：
+默认值面向四张 GPU；`device batch` 是每张 GPU 的 batch：
 
 | 项目 | 默认值 |
 |---|---:|
 | resolution | 512×512 |
-| device batch | 2 |
+| GPU | cuda:0,1,2,3 |
+| world size | 4 |
+| device batch（每卡） | 2 |
 | gradient accumulation | 4 |
+| effective batch | 32 |
 | precision | 自动选择 BF16，否则 FP16 |
 | condition tokens | 8×1024 |
 | condition dropout | 0.1 |
@@ -323,14 +359,16 @@ python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
 | EMA | 0.9999 |
 | gradient clip | 1.0 |
 
-显存不足时按顺序调整：
+单卡显存不足时按顺序调整：
 
 1. `data.batch_size: 2 -> 1`；
-2. `gradient_accumulation_steps: 4 -> 8`，维持 effective batch；
+2. 相应增大 `gradient_accumulation_steps`，维持多卡 effective batch；
 3. `autoencoder.activation_checkpointing: true`（仅影响 Autoencoder 阶段）；
 4. 缩短验证 batch 数或降低 DataLoader workers 不会显著降低训练显存，但可减少主机内存/I/O 压力。
 
 EMA 会额外保存一份模型参数。若 24 GB 环境仍无法容纳 full 阶段，可临时设置 `diffusion.use_ema=false`，但最终生成质量通常更适合使用 EMA，推荐优先减小 device batch。
+
+若只需要单卡训练，仍可使用原来的 `python -m oct_ehr_ldm ...` 命令；此时不会初始化 DDP。
 
 ## 输出和验收标准
 

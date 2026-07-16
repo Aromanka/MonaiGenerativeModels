@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from tqdm.auto import tqdm
@@ -15,6 +16,7 @@ def _base_parser() -> argparse.ArgumentParser:
         description="Fine-tune the MONAI CXR LDM into an EHR-conditioned 2D OCT generator.",
     )
     parser.add_argument("--config", default="configs/oct_ehr_ldm.json", help="Project JSON configuration.")
+    parser.add_argument("--local-rank", "--local_rank", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("prepare-data", help="Validate paired data and write a patient-level split manifest.")
@@ -22,6 +24,9 @@ def _base_parser() -> argparse.ArgumentParser:
 
     autoencoder = subparsers.add_parser("train-autoencoder", help="Adapt the CXR AutoencoderKL to OCT.")
     autoencoder.add_argument("--resume", help="Resume from an oct_autoencoder checkpoint.")
+    autoencoder.add_argument(
+        "--local-rank", "--local_rank", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
 
     evaluate_autoencoder = subparsers.add_parser(
         "evaluate-autoencoder", help="Measure reconstruction and save original/reconstruction/error panels."
@@ -35,6 +40,9 @@ def _base_parser() -> argparse.ArgumentParser:
     diffusion.add_argument("--phase", choices=("alignment", "full"), required=True)
     diffusion.add_argument("--init-checkpoint", help="Initialize a new phase from an earlier diffusion checkpoint.")
     diffusion.add_argument("--resume", help="Resume the same phase, including optimizer/RNG state.")
+    diffusion.add_argument(
+        "--local-rank", "--local_rank", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
 
     evaluate_diffusion = subparsers.add_parser(
         "evaluate-diffusion", help="Compare correct, shuffled, and null EHR conditioning losses."
@@ -113,6 +121,8 @@ def _smoke_test(config, diffusion_checkpoint: str | None) -> dict[str, object]:
 def main(argv: list[str] | None = None) -> None:
     parser = _base_parser()
     args = parser.parse_args(argv)
+    if hasattr(args, "local_rank"):
+        os.environ.setdefault("LOCAL_RANK", str(args.local_rank))
     config = load_config(args.config)
 
     if args.command in {"prepare-data", "inspect-data"}:
@@ -129,8 +139,12 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "train-autoencoder":
         from .autoencoder_training import train_autoencoder
+        from .runtime import distributed_session
 
-        print(f"Best checkpoint: {train_autoencoder(config, resume=args.resume)}")
+        with distributed_session(str(config.get("training.device", "auto"))) as distributed:
+            best = train_autoencoder(config, resume=args.resume, distributed=distributed)
+            if distributed.is_main_process:
+                print(f"Best checkpoint: {best}")
         return
 
     if args.command == "evaluate-autoencoder":
@@ -148,10 +162,18 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "train-diffusion":
         from .diffusion_training import train_diffusion
+        from .runtime import distributed_session
 
-        print(
-            f"Best checkpoint: {train_diffusion(config, args.phase, args.init_checkpoint, resume=args.resume)}"
-        )
+        with distributed_session(str(config.get("training.device", "auto"))) as distributed:
+            best = train_diffusion(
+                config,
+                args.phase,
+                args.init_checkpoint,
+                resume=args.resume,
+                distributed=distributed,
+            )
+            if distributed.is_main_process:
+                print(f"Best checkpoint: {best}")
         return
 
     if args.command == "evaluate-diffusion":

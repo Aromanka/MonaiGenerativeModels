@@ -16,16 +16,22 @@ from .config import ProjectConfig
 from .data import create_datasets, create_loader, load_manifest, safe_torch_load
 from .models import build_cxr_autoencoder, load_module_checkpoint
 from .runtime import (
+    DistributedContext,
+    all_ranks_finite,
+    all_reduce_sum,
     append_jsonl,
     atomic_torch_save,
     autocast_context,
-    capture_rng_state,
     cosine_warmup_lambda,
+    ddp_sync_context,
+    gather_rng_states,
+    local_batch_limit,
     make_grad_scaler,
     resolve_precision,
-    restore_rng_state,
+    restore_distributed_rng_state,
     seed_everything,
     select_device,
+    wrap_ddp,
 )
 
 
@@ -49,13 +55,23 @@ def validate_autoencoder(
     dtype: torch.dtype | None,
     amp_enabled: bool,
     max_batches: int | None = None,
+    distributed: DistributedContext | None = None,
 ) -> dict[str, float]:
+    context = distributed or DistributedContext(device=device)
     model.eval()
     absolute_error = 0.0
     squared_error = 0.0
     element_count = 0
-    total = max(0, min(len(loader), max_batches)) if max_batches is not None else len(loader)
-    progress = tqdm(islice(loader, total), total=total, desc="Validating autoencoder", unit="batch", leave=False)
+    local_max_batches = local_batch_limit(max_batches, context)
+    total = max(0, min(len(loader), local_max_batches)) if local_max_batches is not None else len(loader)
+    progress = tqdm(
+        islice(loader, total),
+        total=total,
+        desc="Validating autoencoder",
+        unit="batch",
+        leave=False,
+        disable=not context.is_main_process,
+    )
     for batch in progress:
         images = batch["image"].to(device, non_blocking=True)
         with autocast_context(device, dtype, amp_enabled):
@@ -64,6 +80,11 @@ def validate_autoencoder(
         absolute_error += delta.abs().sum().item()
         squared_error += delta.pow(2).sum().item()
         element_count += delta.numel()
+    statistics = torch.tensor(
+        [absolute_error, squared_error, element_count], device=device, dtype=torch.float64
+    )
+    all_reduce_sum(statistics, context)
+    absolute_error, squared_error, element_count = statistics.tolist()
     if element_count == 0:
         raise ValueError("Validation loader produced no images")
     mae = absolute_error / element_count
@@ -82,6 +103,8 @@ def _autoencoder_payload(
     best_val: float,
     config: ProjectConfig,
     manifest: dict[str, Any],
+    rng_states: list[dict[str, Any]],
+    world_size: int,
 ) -> dict[str, Any]:
     return {
         "kind": "oct_autoencoder",
@@ -92,20 +115,33 @@ def _autoencoder_payload(
         "epoch": epoch,
         "global_step": global_step,
         "best_val_mae": best_val,
-        "rng_state": capture_rng_state(),
+        "rng_state": rng_states[0],
+        "rng_states": rng_states,
+        "world_size": world_size,
         "manifest_fingerprint": manifest["fingerprint"],
         "config": config.data,
     }
 
 
-def train_autoencoder(config: ProjectConfig, resume: str | Path | None = None) -> Path:
+def train_autoencoder(
+    config: ProjectConfig,
+    resume: str | Path | None = None,
+    distributed: DistributedContext | None = None,
+) -> Path:
+    context = distributed or DistributedContext(
+        device=select_device(str(config.get("training.device", "auto")))
+    )
     seed = int(config.get("training.seed", 2026))
-    seed_everything(seed)
-    device = select_device(str(config.get("training.device", "auto")))
+    seed_everything(seed + context.rank)
+    device = context.device
     dtype, amp_enabled = resolve_precision(device, str(config.get("training.precision", "auto")))
-    manifest = load_manifest(config)
+    if context.is_main_process:
+        manifest = load_manifest(config)
+    context.barrier()
+    if not context.is_main_process:
+        manifest = load_manifest(config, create_if_missing=False)
     train_dataset, val_dataset = create_datasets(config, manifest)
-    val_loader = create_loader(val_dataset, config, training=False)
+    val_loader = create_loader(val_dataset, config, training=False, distributed=context)
 
     use_checkpointing = bool(config.get("autoencoder.activation_checkpointing", False))
     source_checkpoint = config.path("paths.cxr_autoencoder_checkpoint")
@@ -120,7 +156,8 @@ def train_autoencoder(config: ProjectConfig, resume: str | Path | None = None) -
     )
     epochs = int(config.get("autoencoder.epochs", 20))
     accumulation = max(1, int(config.get("training.gradient_accumulation_steps", 1)))
-    steps_per_epoch = max(1, math.ceil(math.ceil(len(train_dataset) / int(config.get("data.batch_size", 4))) / accumulation))
+    schedule_loader = create_loader(train_dataset, config, training=True, epoch=0, distributed=context)
+    steps_per_epoch = max(1, math.ceil(len(schedule_loader) / accumulation))
     total_steps = epochs * steps_per_epoch
     warmup_steps = int(total_steps * float(config.get("training.warmup_fraction", 0.03)))
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -148,6 +185,12 @@ def train_autoencoder(config: ProjectConfig, resume: str | Path | None = None) -
         checkpoint = safe_torch_load(resume)
         if checkpoint.get("manifest_fingerprint") != manifest["fingerprint"]:
             raise ValueError("Resume checkpoint was created from a different data manifest")
+        checkpoint_world_size = int(checkpoint.get("world_size", 1))
+        if checkpoint_world_size != context.world_size:
+            raise ValueError(
+                f"Cannot exactly resume a world_size={checkpoint_world_size} checkpoint with "
+                f"world_size={context.world_size}"
+            )
         model.load_state_dict(checkpoint["model"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
         lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
@@ -155,10 +198,15 @@ def train_autoencoder(config: ProjectConfig, resume: str | Path | None = None) -
         start_epoch = int(checkpoint["epoch"])
         global_step = int(checkpoint["global_step"])
         best_val = float(checkpoint.get("best_val_mae", best_val))
-        restore_rng_state(checkpoint.get("rng_state"))
+
+    train_model = wrap_ddp(model, context)
+    if resume is not None:
+        restore_distributed_rng_state(checkpoint, context)
 
     output_dir = config.path("paths.autoencoder_output_dir")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if context.is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    context.barrier()
     metrics_path = output_dir / "metrics.jsonl"
     kl_weight = float(config.get("autoencoder.kl_weight", 1e-6))
     clip_norm = float(config.get("training.gradient_clip_norm", 1.0))
@@ -166,35 +214,63 @@ def train_autoencoder(config: ProjectConfig, resume: str | Path | None = None) -
     max_val_batches = int(max_val_batches) if max_val_batches is not None else None
     started = time.time()
 
-    epochs_progress = tqdm(range(start_epoch, epochs), desc="Training autoencoder", unit="epoch")
+    if context.is_main_process:
+        print(
+            json.dumps(
+                {
+                    "distributed": context.distributed,
+                    "world_size": context.world_size,
+                    "per_device_batch": int(config.get("data.batch_size", 4)),
+                    "gradient_accumulation": accumulation,
+                    "effective_batch": int(config.get("data.batch_size", 4))
+                    * accumulation
+                    * context.world_size,
+                }
+            )
+        )
+    epochs_progress = tqdm(
+        range(start_epoch, epochs),
+        desc="Training autoencoder",
+        unit="epoch",
+        disable=not context.is_main_process,
+    )
     for epoch in epochs_progress:
-        model.train()
-        loader = create_loader(train_dataset, config, training=True, epoch=epoch)
+        train_model.train()
+        loader = create_loader(train_dataset, config, training=True, epoch=epoch, distributed=context)
         optimizer.zero_grad(set_to_none=True)
         totals = {"loss": 0.0, "l1": 0.0, "kl": 0.0, "perceptual": 0.0}
         batch_count = 0
-        batches_progress = tqdm(loader, desc=f"Epoch {epoch + 1}/{epochs}", unit="batch", leave=False)
+        batches_progress = tqdm(
+            loader,
+            desc=f"Epoch {epoch + 1}/{epochs}",
+            unit="batch",
+            leave=False,
+            disable=not context.is_main_process,
+        )
         for batch_index, batch in enumerate(batches_progress):
             images = batch["image"].to(device, non_blocking=True)
-            with autocast_context(device, dtype, amp_enabled):
-                reconstruction, mu, sigma = model(images)
-                l1 = F.l1_loss(reconstruction.float(), images.float())
-                kl = _kl_loss(mu, sigma)
-                p_loss = (
-                    perceptual_loss(reconstruction.float(), images.float())
-                    if perceptual_loss is not None
-                    else torch.zeros((), device=device)
-                )
-                loss = l1 + kl_weight * kl + perceptual_weight * p_loss
-            if not torch.isfinite(loss):
-                raise FloatingPointError(
-                    f"Non-finite Autoencoder loss at epoch {epoch}, batch {batch_index}: {loss.item()}"
-                )
-            scaler.scale(loss / accumulation).backward()
             should_step = (batch_index + 1) % accumulation == 0 or batch_index + 1 == len(loader)
+            with ddp_sync_context((train_model,), should_step):
+                with autocast_context(device, dtype, amp_enabled):
+                    reconstruction, mu, sigma = train_model(images)
+                    l1 = F.l1_loss(reconstruction.float(), images.float())
+                    kl = _kl_loss(mu, sigma)
+                    p_loss = (
+                        perceptual_loss(reconstruction.float(), images.float())
+                        if perceptual_loss is not None
+                        else torch.zeros((), device=device)
+                    )
+                    loss = l1 + kl_weight * kl + perceptual_weight * p_loss
+                if not all_ranks_finite(loss, context):
+                    raise FloatingPointError(
+                        f"Non-finite Autoencoder loss at epoch {epoch}, batch {batch_index}: {loss.item()}"
+                    )
+                scaler.scale(loss / accumulation).backward()
             if should_step:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+                gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+                if not all_ranks_finite(gradient_norm, context):
+                    raise FloatingPointError(f"Non-finite Autoencoder gradient norm at epoch {epoch}")
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
@@ -208,32 +284,60 @@ def train_autoencoder(config: ProjectConfig, resume: str | Path | None = None) -
             batches_progress.set_postfix(loss=f"{loss.item():.4f}", step=global_step)
 
         validation = validate_autoencoder(
-            model, val_loader, device, dtype, amp_enabled, max_batches=max_val_batches
+            model,
+            val_loader,
+            device,
+            dtype,
+            amp_enabled,
+            max_batches=max_val_batches,
+            distributed=context,
         )
+        train_statistics = torch.tensor(
+            [totals["loss"], totals["l1"], totals["kl"], totals["perceptual"], batch_count],
+            device=device,
+            dtype=torch.float64,
+        )
+        all_reduce_sum(train_statistics, context)
+        train_loss, train_l1, train_kl, train_perceptual, global_batch_count = train_statistics.tolist()
         row = {
             "stage": "autoencoder",
             "epoch": epoch + 1,
             "global_step": global_step,
             "lr": optimizer.param_groups[0]["lr"],
-            "train_loss": totals["loss"] / max(1, batch_count),
-            "train_l1": totals["l1"] / max(1, batch_count),
-            "train_kl": totals["kl"] / max(1, batch_count),
-            "train_perceptual": totals["perceptual"] / max(1, batch_count),
+            "train_loss": train_loss / max(1, global_batch_count),
+            "train_l1": train_l1 / max(1, global_batch_count),
+            "train_kl": train_kl / max(1, global_batch_count),
+            "train_perceptual": train_perceptual / max(1, global_batch_count),
             "val_mae": validation["mae"],
             "val_mse": validation["mse"],
             "val_psnr": validation["psnr"],
             "elapsed_seconds": time.time() - started,
         }
-        append_jsonl(metrics_path, row)
-        print(json.dumps(row, ensure_ascii=False))
+        if context.is_main_process:
+            append_jsonl(metrics_path, row)
+            print(json.dumps(row, ensure_ascii=False))
         epochs_progress.set_postfix(train=f"{row['train_loss']:.4f}", val=f"{validation['mae']:.4f}")
+        is_best = validation["mae"] < best_val
         best_val = min(best_val, validation["mae"])
-        payload = _autoencoder_payload(
-            model, optimizer, lr_scheduler, scaler, epoch + 1, global_step, best_val, config, manifest
-        )
-        atomic_torch_save(payload, output_dir / "last.pt")
-        if validation["mae"] <= best_val:
-            atomic_torch_save(payload, output_dir / "best.pt")
+        rng_states = gather_rng_states(context)
+        if context.is_main_process:
+            payload = _autoencoder_payload(
+                model,
+                optimizer,
+                lr_scheduler,
+                scaler,
+                epoch + 1,
+                global_step,
+                best_val,
+                config,
+                manifest,
+                rng_states,
+                context.world_size,
+            )
+            atomic_torch_save(payload, output_dir / "last.pt")
+            if is_best:
+                atomic_torch_save(payload, output_dir / "best.pt")
+        context.barrier()
     return output_dir / "best.pt"
 
 

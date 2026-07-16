@@ -32,17 +32,25 @@ from .models import (
     load_module_checkpoint,
 )
 from .runtime import (
+    DistributedContext,
     ModuleEMA,
+    all_ranks_finite,
+    all_reduce_sum,
     append_jsonl,
     atomic_torch_save,
     autocast_context,
     capture_rng_state,
     cosine_warmup_lambda,
+    ddp_sync_context,
+    gather_rng_states,
+    local_batch_limit,
     make_grad_scaler,
     resolve_precision,
+    restore_distributed_rng_state,
     restore_rng_state,
     seed_everything,
     select_device,
+    wrap_ddp,
 )
 
 
@@ -79,12 +87,22 @@ def compute_latent_scale_factor(
     dtype: torch.dtype | None,
     amp_enabled: bool,
     max_batches: int = 50,
+    distributed: DistributedContext | None = None,
 ) -> float:
+    context = distributed or DistributedContext(device=device)
     value_sum = 0.0
     square_sum = 0.0
     count = 0
-    total = max(0, min(len(loader), max_batches))
-    for batch in tqdm(islice(loader, total), total=total, desc="Estimating latent scale", unit="batch", leave=False):
+    local_max_batches = local_batch_limit(max_batches, context)
+    total = max(0, min(len(loader), local_max_batches))
+    for batch in tqdm(
+        islice(loader, total),
+        total=total,
+        desc="Estimating latent scale",
+        unit="batch",
+        leave=False,
+        disable=not context.is_main_process,
+    ):
         images = batch["image"].to(device, non_blocking=True)
         with autocast_context(device, dtype, amp_enabled):
             latent = autoencoder.encode_stage_2_inputs(images)
@@ -92,6 +110,9 @@ def compute_latent_scale_factor(
         value_sum += latent.sum().item()
         square_sum += latent.pow(2).sum().item()
         count += latent.numel()
+    statistics = torch.tensor([value_sum, square_sum, count], device=device, dtype=torch.float64)
+    all_reduce_sum(statistics, context)
+    value_sum, square_sum, count = statistics.tolist()
     if count < 2:
         raise ValueError("Not enough latent values to estimate a scale factor")
     variance = max(square_sum / count - (value_sum / count) ** 2, 1e-12)
@@ -172,7 +193,9 @@ def validate_diffusion(
     amp_enabled: bool,
     max_batches: int = 20,
     compare_conditions: bool = False,
+    distributed: DistributedContext | None = None,
 ) -> dict[str, float]:
+    context = distributed or DistributedContext(device=device)
     autoencoder.eval()
     diffusion.eval()
     projector.eval()
@@ -186,14 +209,22 @@ def validate_diffusion(
         for index, patient_id in enumerate(validation_patient_ids)
     }
     # Fixed RNG makes validation comparable and does not consume the training stream.
-    rng_state = capture_rng_state()
-    torch.manual_seed(314159)
+    rng_state = capture_rng_state(device)
+    torch.manual_seed(314159 + context.rank)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(314159)
+        torch.cuda.manual_seed(314159 + context.rank)
     try:
-        total = max(0, min(len(loader), max_batches))
+        local_max_batches = local_batch_limit(max_batches, context)
+        total = max(0, min(len(loader), local_max_batches))
         description = "Comparing conditions" if compare_conditions else "Validating diffusion"
-        for batch in tqdm(islice(loader, total), total=total, desc=description, unit="batch", leave=False):
+        for batch in tqdm(
+            islice(loader, total),
+            total=total,
+            desc=description,
+            unit="batch",
+            leave=False,
+            disable=not context.is_main_process,
+        ):
             images = batch["image"].to(device, non_blocking=True)
             ehr = batch["ehr"].to(device, non_blocking=True)
             view_ids = batch["view_id"].to(device, non_blocking=True)
@@ -229,6 +260,27 @@ def validate_diffusion(
                     counts["null"] += 1
     finally:
         restore_rng_state(rng_state)
+    aggregate = torch.tensor(
+        [
+            totals["correct"],
+            totals["shuffled"],
+            totals["null"],
+            counts["correct"],
+            counts["shuffled"],
+            counts["null"],
+        ],
+        device=device,
+        dtype=torch.float64,
+    )
+    all_reduce_sum(aggregate, context)
+    (
+        totals["correct"],
+        totals["shuffled"],
+        totals["null"],
+        counts["correct"],
+        counts["shuffled"],
+        counts["null"],
+    ) = aggregate.tolist()
     if counts["correct"] == 0:
         raise ValueError("Validation loader produced no batches")
     results = {"correct_loss": totals["correct"] / counts["correct"]}
@@ -255,6 +307,8 @@ def _diffusion_payload(
     scale_factor: float,
     config: ProjectConfig,
     manifest: dict[str, Any],
+    rng_states: list[dict[str, Any]],
+    world_size: int,
 ) -> dict[str, Any]:
     return {
         "kind": "ehr_conditioned_oct_ldm",
@@ -274,7 +328,9 @@ def _diffusion_payload(
         "image_size": int(config.get("data.image_size", 512)),
         "view_to_id": manifest["view_to_id"],
         "manifest_fingerprint": manifest["fingerprint"],
-        "rng_state": capture_rng_state(),
+        "rng_state": rng_states[0],
+        "rng_states": rng_states,
+        "world_size": world_size,
         "config": config.data,
     }
 
@@ -284,19 +340,34 @@ def train_diffusion(
     phase: str,
     init_checkpoint: str | Path | None = None,
     resume: str | Path | None = None,
+    distributed: DistributedContext | None = None,
 ) -> Path:
     if init_checkpoint is not None and resume is not None:
         raise ValueError("Use either init_checkpoint (new phase) or resume (same phase), not both")
-    seed_everything(int(config.get("training.seed", 2026)))
-    device = select_device(str(config.get("training.device", "auto")))
+    context = distributed or DistributedContext(
+        device=select_device(str(config.get("training.device", "auto")))
+    )
+    seed_everything(int(config.get("training.seed", 2026)) + context.rank)
+    device = context.device
     dtype, amp_enabled = resolve_precision(device, str(config.get("training.precision", "auto")))
-    manifest = load_manifest(config)
+    if context.is_main_process:
+        manifest = load_manifest(config)
+    context.barrier()
+    if not context.is_main_process:
+        manifest = load_manifest(config, create_if_missing=False)
     train_dataset, val_dataset = create_datasets(config, manifest)
-    val_loader = create_loader(val_dataset, config, training=False)
+    val_loader = create_loader(val_dataset, config, training=False, distributed=context)
     autoencoder = _load_autoencoder(config, device)
     noise_scheduler = build_cxr_scheduler()
 
     resume_payload = safe_torch_load(resume) if resume is not None else None
+    if resume_payload is not None:
+        checkpoint_world_size = int(resume_payload.get("world_size", 1))
+        if checkpoint_world_size != context.world_size:
+            raise ValueError(
+                f"Cannot exactly resume a world_size={checkpoint_world_size} checkpoint with "
+                f"world_size={context.world_size}"
+            )
     effective_init = resume_payload if resume_payload is not None else init_checkpoint
     diffusion, projector, init_payload = _load_initial_diffusion(
         config, manifest, device, effective_init, apply_ema=resume_payload is None
@@ -311,17 +382,20 @@ def train_diffusion(
     trainable_names = configure_diffusion_phase(diffusion, phase)
     for parameter in projector.parameters():
         parameter.requires_grad = True
-    print(
-        json.dumps(
-            {
-                "phase": phase,
-                "diffusion_trainable_parameters": count_parameters(diffusion, trainable_only=True),
-                "diffusion_total_parameters": count_parameters(diffusion),
-                "projector_parameters": count_parameters(projector),
-                "cross_attention_tensors": len(trainable_names) if phase == "alignment" else None,
-            }
+    if context.is_main_process:
+        print(
+            json.dumps(
+                {
+                    "phase": phase,
+                    "distributed": context.distributed,
+                    "world_size": context.world_size,
+                    "diffusion_trainable_parameters": count_parameters(diffusion, trainable_only=True),
+                    "diffusion_total_parameters": count_parameters(diffusion),
+                    "projector_parameters": count_parameters(projector),
+                    "cross_attention_tensors": len(trainable_names) if phase == "alignment" else None,
+                }
+            )
         )
-    )
 
     phase_config = f"diffusion.{phase}"
     unet_lr = float(config.get(f"{phase_config}.unet_learning_rate", 1e-5))
@@ -342,14 +416,6 @@ def train_diffusion(
         optimizer, lambda step: cosine_warmup_lambda(step, max_steps, warmup_steps)
     )
     scaler = make_grad_scaler(dtype)
-    ema = (
-        ModuleEMA(
-            {"diffusion": diffusion, "projector": projector},
-            decay=float(config.get("diffusion.ema_decay", 0.9999)),
-        )
-        if bool(config.get("diffusion.use_ema", True))
-        else None
-    )
 
     configured_scale = config.get("diffusion.scale_factor")
     if resume_payload is not None:
@@ -362,7 +428,9 @@ def train_diffusion(
         saved_augmentation = train_dataset.intensity_augmentation
         train_dataset.intensity_augmentation = 0.0
         try:
-            train_loader_for_scale = create_loader(train_dataset, config, training=False)
+            train_loader_for_scale = create_loader(
+                train_dataset, config, training=False, distributed=context
+            )
             scale_factor = compute_latent_scale_factor(
                 autoencoder,
                 train_loader_for_scale,
@@ -370,12 +438,14 @@ def train_diffusion(
                 dtype,
                 amp_enabled,
                 max_batches=int(config.get("diffusion.scale_estimation_batches", 50)),
+                distributed=context,
             )
         finally:
             train_dataset.intensity_augmentation = saved_augmentation
     if not math.isfinite(scale_factor) or scale_factor <= 0:
         raise ValueError(f"Invalid latent scale factor: {scale_factor}")
-    print(f"OCT latent scale factor: {scale_factor:.8f}")
+    if context.is_main_process:
+        print(f"OCT latent scale factor: {scale_factor:.8f}")
 
     start_epoch = 0
     start_batch = 0
@@ -385,16 +455,30 @@ def train_diffusion(
         optimizer.load_state_dict(resume_payload["optimizer"])
         lr_scheduler.load_state_dict(resume_payload["lr_scheduler"])
         scaler.load_state_dict(resume_payload.get("grad_scaler", {}))
-        if ema is not None and resume_payload.get("ema") is not None:
-            ema.load_state_dict(resume_payload["ema"])
         start_epoch = int(resume_payload["epoch"])
         start_batch = int(resume_payload.get("next_batch", 0))
         global_step = int(resume_payload["global_step"])
         best_val = float(resume_payload.get("best_val_loss", best_val))
-        restore_rng_state(resume_payload.get("rng_state"))
+
+    train_diffusion_model = wrap_ddp(diffusion, context)
+    train_projector_model = wrap_ddp(projector, context)
+    ema = (
+        ModuleEMA(
+            {"diffusion": diffusion, "projector": projector},
+            decay=float(config.get("diffusion.ema_decay", 0.9999)),
+        )
+        if bool(config.get("diffusion.use_ema", True))
+        else None
+    )
+    if resume_payload is not None:
+        if ema is not None and resume_payload.get("ema") is not None:
+            ema.load_state_dict(resume_payload["ema"])
+        restore_distributed_rng_state(resume_payload, context)
 
     output_dir = config.path(f"paths.{phase}_output_dir")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if context.is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    context.barrier()
     metrics_path = output_dir / "metrics.jsonl"
     accumulation = max(1, int(config.get("training.gradient_accumulation_steps", 1)))
     clip_norm = float(config.get("training.gradient_clip_norm", 1.0))
@@ -415,41 +499,43 @@ def train_diffusion(
         initial=global_step,
         desc=f"Training diffusion ({phase})",
         unit="step",
+        disable=not context.is_main_process,
     )
     while global_step < max_steps:
-        loader = create_loader(train_dataset, config, training=True, epoch=epoch)
-        diffusion.train()
-        projector.train()
+        loader = create_loader(train_dataset, config, training=True, epoch=epoch, distributed=context)
+        train_diffusion_model.train()
+        train_projector_model.train()
         autoencoder.eval()
         optimizer.zero_grad(set_to_none=True)
         for batch_index, batch in enumerate(loader):
             if epoch == start_epoch and batch_index < start_batch:
                 continue
-            with autocast_context(device, dtype, amp_enabled):
-                loss = _diffusion_loss(
-                    batch,
-                    autoencoder,
-                    diffusion,
-                    projector,
-                    noise_scheduler,
-                    scale_factor,
-                    device,
-                    condition_dropout,
-                )
-            if not torch.isfinite(loss):
-                raise FloatingPointError(
-                    f"Non-finite diffusion loss at phase {phase}, epoch {epoch}, batch {batch_index}: {loss.item()}"
-                )
-            scaler.scale(loss / accumulation).backward()
+            should_step = (batch_index + 1) % accumulation == 0 or batch_index + 1 == len(loader)
+            with ddp_sync_context((train_diffusion_model, train_projector_model), should_step):
+                with autocast_context(device, dtype, amp_enabled):
+                    loss = _diffusion_loss(
+                        batch,
+                        autoencoder,
+                        train_diffusion_model,
+                        train_projector_model,
+                        noise_scheduler,
+                        scale_factor,
+                        device,
+                        condition_dropout,
+                    )
+                if not all_ranks_finite(loss, context):
+                    raise FloatingPointError(
+                        f"Non-finite diffusion loss at phase {phase}, epoch {epoch}, batch {batch_index}: {loss.item()}"
+                    )
+                scaler.scale(loss / accumulation).backward()
             running_loss += loss.item()
             running_batches += 1
-            should_step = (batch_index + 1) % accumulation == 0 or batch_index + 1 == len(loader)
             if not should_step:
                 continue
             scaler.unscale_(optimizer)
             trainable_parameters = [parameter for group in optimizer.param_groups for parameter in group["params"]]
             gradient_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, clip_norm)
-            if not torch.isfinite(gradient_norm):
+            if not all_ranks_finite(gradient_norm, context):
                 raise FloatingPointError(
                     f"Non-finite gradient norm at phase {phase}, epoch {epoch}, batch {batch_index}"
                 )
@@ -468,19 +554,25 @@ def train_diffusion(
             if next_batch >= len(loader):
                 next_epoch, next_batch = epoch + 1, 0
             if global_step % log_every == 0:
+                log_statistics = torch.tensor(
+                    [running_loss, running_batches], device=device, dtype=torch.float64
+                )
+                all_reduce_sum(log_statistics, context)
+                global_running_loss, global_running_batches = log_statistics.tolist()
                 row = {
                     "stage": "diffusion",
                     "phase": phase,
                     "epoch": epoch,
                     "global_step": global_step,
-                    "train_loss": running_loss / max(1, running_batches),
+                    "train_loss": global_running_loss / max(1, global_running_batches),
                     "gradient_norm": float(gradient_norm),
                     "diffusion_lr": optimizer.param_groups[0]["lr"],
                     "projector_lr": optimizer.param_groups[1]["lr"],
                     "elapsed_seconds": time.time() - started,
                 }
-                append_jsonl(metrics_path, row)
-                print(json.dumps(row))
+                if context.is_main_process:
+                    append_jsonl(metrics_path, row)
+                    print(json.dumps(row))
                 running_loss = 0.0
                 running_batches = 0
 
@@ -498,35 +590,44 @@ def train_diffusion(
                     amp_enabled,
                     max_batches=max_val_batches,
                     compare_conditions=False,
+                    distributed=context,
                 )
                 validation_row = {"stage": "validation", "phase": phase, "global_step": global_step, **validation}
-                append_jsonl(metrics_path, validation_row)
-                print(json.dumps(validation_row))
+                if context.is_main_process:
+                    append_jsonl(metrics_path, validation_row)
+                    print(json.dumps(validation_row))
                 is_best = validation["correct_loss"] < best_val
                 best_val = min(best_val, validation["correct_loss"])
+                train_diffusion_model.train()
+                train_projector_model.train()
             else:
                 is_best = False
 
             if global_step % save_every == 0 or validation is not None or global_step == max_steps:
-                payload = _diffusion_payload(
-                    diffusion,
-                    projector,
-                    optimizer,
-                    lr_scheduler,
-                    scaler,
-                    ema,
-                    phase,
-                    next_epoch,
-                    next_batch,
-                    global_step,
-                    best_val,
-                    scale_factor,
-                    config,
-                    manifest,
-                )
-                atomic_torch_save(payload, output_dir / "last.pt")
-                if is_best:
-                    atomic_torch_save(payload, output_dir / "best.pt")
+                rng_states = gather_rng_states(context)
+                if context.is_main_process:
+                    payload = _diffusion_payload(
+                        diffusion,
+                        projector,
+                        optimizer,
+                        lr_scheduler,
+                        scaler,
+                        ema,
+                        phase,
+                        next_epoch,
+                        next_batch,
+                        global_step,
+                        best_val,
+                        scale_factor,
+                        config,
+                        manifest,
+                        rng_states,
+                        context.world_size,
+                    )
+                    atomic_torch_save(payload, output_dir / "last.pt")
+                    if is_best:
+                        atomic_torch_save(payload, output_dir / "best.pt")
+                context.barrier()
             if global_step >= max_steps:
                 break
         epoch += 1
