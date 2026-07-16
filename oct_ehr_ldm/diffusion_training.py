@@ -395,6 +395,19 @@ def train_diffusion(
             )
         ),
     )
+    max_epochs = int(config.get(f"{phase_config}.max_epochs", 30 if phase == "alignment" else 150))
+    if max_epochs <= 0:
+        raise ValueError(f"{phase_config}.max_epochs must be positive")
+    schedule_loader = create_loader(
+        train_dataset,
+        config,
+        training=True,
+        epoch=0,
+        distributed=context,
+        batch_size=stage_batch_size,
+    )
+    steps_per_epoch = max(1, math.ceil(len(schedule_loader) / stage_accumulation))
+    total_steps = max_epochs * steps_per_epoch
     if context.is_main_process:
         print(
             json.dumps(
@@ -405,6 +418,9 @@ def train_diffusion(
                     "per_device_batch": stage_batch_size,
                     "gradient_accumulation": stage_accumulation,
                     "effective_batch": stage_batch_size * stage_accumulation * context.world_size,
+                    "max_epochs": max_epochs,
+                    "optimizer_steps_per_epoch": steps_per_epoch,
+                    "planned_optimizer_steps": total_steps,
                     "diffusion_trainable_parameters": count_parameters(diffusion, trainable_only=True),
                     "diffusion_total_parameters": count_parameters(diffusion),
                     "projector_parameters": count_parameters(projector),
@@ -425,10 +441,9 @@ def train_diffusion(
         eps=1e-8,
         weight_decay=float(config.get(f"{phase_config}.weight_decay", 0.01)),
     )
-    max_steps = int(config.get(f"{phase_config}.max_steps", 10000 if phase == "alignment" else 100000))
-    warmup_steps = int(max_steps * float(config.get("training.warmup_fraction", 0.03)))
+    warmup_steps = int(total_steps * float(config.get("training.warmup_fraction", 0.03)))
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda step: cosine_warmup_lambda(step, max_steps, warmup_steps)
+        optimizer, lambda step: cosine_warmup_lambda(step, total_steps, warmup_steps)
     )
     scaler = make_grad_scaler(dtype)
 
@@ -510,13 +525,13 @@ def train_diffusion(
     running_batches = 0
 
     training_progress = tqdm(
-        total=max_steps,
-        initial=global_step,
+        total=max_epochs,
+        initial=start_epoch,
         desc=f"Training diffusion ({phase})",
-        unit="step",
+        unit="epoch",
         disable=not context.is_main_process,
     )
-    while global_step < max_steps:
+    while epoch < max_epochs:
         loader = create_loader(
             train_dataset,
             config,
@@ -566,8 +581,7 @@ def train_diffusion(
             optimizer.zero_grad(set_to_none=True)
             lr_scheduler.step()
             global_step += 1
-            training_progress.update(1)
-            training_progress.set_postfix(loss=f"{loss.item():.4f}", epoch=epoch)
+            training_progress.set_postfix(loss=f"{loss.item():.4f}", step=global_step)
             if ema is not None:
                 ema.update({"diffusion": diffusion, "projector": projector})
 
@@ -575,6 +589,7 @@ def train_diffusion(
             next_batch = batch_index + 1
             if next_batch >= len(loader):
                 next_epoch, next_batch = epoch + 1, 0
+            final_update = next_epoch >= max_epochs
             if global_step % log_every == 0:
                 log_statistics = torch.tensor(
                     [running_loss, running_batches], device=device, dtype=torch.float64
@@ -599,7 +614,7 @@ def train_diffusion(
                 running_batches = 0
 
             validation: dict[str, float] | None = None
-            if global_step % validate_every == 0 or global_step == max_steps:
+            if global_step % validate_every == 0 or final_update:
                 validation = validate_diffusion(
                     autoencoder,
                     diffusion,
@@ -625,7 +640,7 @@ def train_diffusion(
             else:
                 is_best = False
 
-            if global_step % save_every == 0 or validation is not None or global_step == max_steps:
+            if global_step % save_every == 0 or validation is not None or final_update:
                 rng_states = gather_rng_states(context)
                 if context.is_main_process:
                     payload = _diffusion_payload(
@@ -650,10 +665,9 @@ def train_diffusion(
                     if is_best:
                         atomic_torch_save(payload, output_dir / "best.pt")
                 context.barrier()
-            if global_step >= max_steps:
-                break
         epoch += 1
         start_batch = 0
+        training_progress.update(1)
     training_progress.close()
     return output_dir / "best.pt"
 

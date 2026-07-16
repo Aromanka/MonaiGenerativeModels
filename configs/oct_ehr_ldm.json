@@ -34,7 +34,7 @@
   "autoencoder": {
     "batch_size": 4,
     "gradient_accumulation_steps": 4,
-    "epochs": 1,
+    "max_epochs": 1,
     "learning_rate": 0.0001,
     "weight_decay": 0.01,
     "kl_weight": 0.000001,
@@ -58,7 +58,7 @@
     "alignment": {
       "batch_size": 16,
       "gradient_accumulation_steps": 1,
-      "max_steps": 10000,
+      "max_epochs": 30,
       "unet_learning_rate": 0.0001,
       "projector_learning_rate": 0.0001,
       "weight_decay": 0.01,
@@ -68,7 +68,7 @@
     "full": {
       "batch_size": 2,
       "gradient_accumulation_steps": 4,
-      "max_steps": 100000,
+      "max_epochs": 150,
       "unet_learning_rate": 0.00001,
       "projector_learning_rate": 0.00005,
       "weight_decay": 0.01,

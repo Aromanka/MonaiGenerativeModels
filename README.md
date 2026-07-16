@@ -116,6 +116,8 @@ model-zoo/models/cxr_image_synthesis_latent_diffusion_model/models/diffusion_mod
 控制梯度累积；验证和独立评估使用 `data.eval_batch_size`。准备数据、检查、评估和采样仍使用普通的
 单进程命令。如果需要改变 GPU 数量，应同时修改 `CUDA_VISIBLE_DEVICES` 和 `--nproc_per_node`；
 同一阶段的 `--resume` 必须沿用创建 checkpoint 时的 GPU 数量。
+三个训练阶段均按 epoch 结束训练，分别由 `autoencoder.max_epochs`、
+`diffusion.alignment.max_epochs` 和 `diffusion.full.max_epochs` 控制，不再使用 `max_steps` 作为终止条件。
 旧版 checkpoint 没有 `world_size` 字段，会按单卡 checkpoint 处理，不能直接用四卡 `--resume`；但模型权重
 仍可用于评估，alignment 的 `best.pt` 也仍可通过 `--init-checkpoint` 初始化 full 阶段。
 
@@ -176,7 +178,8 @@ original | reconstruction | absolute error
 ### 4. Stage 1：OCT Autoencoder domain adaptation
 
 本阶段每卡 batch size 由 `autoencoder.batch_size` 控制，默认值为 4；梯度累积由
-`autoencoder.gradient_accumulation_steps` 控制，默认值为 4。
+`autoencoder.gradient_accumulation_steps` 控制，默认值为 4；训练轮数由 `autoencoder.max_epochs`
+控制，默认值为 1。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
@@ -221,8 +224,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
 
 ### 5. Stage 2：EHR condition alignment
 
-本阶段每卡 batch size 由 `diffusion.alignment.batch_size` 控制，默认值为 4；梯度累积由
-`diffusion.alignment.gradient_accumulation_steps` 控制，默认值为 4。
+本阶段每卡 batch size 由 `diffusion.alignment.batch_size` 控制，默认值为 16；梯度累积由
+`diffusion.alignment.gradient_accumulation_steps` 控制，默认值为 1；训练轮数由
+`diffusion.alignment.max_epochs` 控制，默认值为 30。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
@@ -286,7 +290,8 @@ python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
 ### 7. Stage 3：完整 Diffusion U-Net 微调
 
 本阶段每卡 batch size 由 `diffusion.full.batch_size` 控制，默认值为 2；梯度累积由
-`diffusion.full.gradient_accumulation_steps` 控制，默认值为 4。
+`diffusion.full.gradient_accumulation_steps` 控制，默认值为 4；训练轮数由
+`diffusion.full.max_epochs` 控制，默认值为 150。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
@@ -361,19 +366,20 @@ python -m oct_ehr_ldm --config configs/oct_ehr_ldm.json \
 | GPU | cuda:0,1,2,3 |
 | world size | 4 |
 | Autoencoder batch（每卡） | 4 |
-| alignment batch（每卡） | 4 |
+| alignment batch（每卡） | 16 |
 | full batch（每卡） | 2 |
 | eval batch | 4 |
 | Autoencoder gradient accumulation | 4 |
-| alignment gradient accumulation | 4 |
+| alignment gradient accumulation | 1 |
 | full gradient accumulation | 4 |
 | Autoencoder/alignment effective batch | 64 |
 | full effective batch | 32 |
 | precision | 自动选择 BF16，否则 FP16 |
 | condition tokens | 8×1024 |
 | condition dropout | 0.1 |
-| alignment steps | 10,000 |
-| full steps | 100,000 |
+| Autoencoder epochs | 1 |
+| alignment epochs | 30 |
+| full epochs | 150 |
 | EMA | 0.9999 |
 | gradient clip | 1.0 |
 

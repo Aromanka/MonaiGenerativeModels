@@ -154,7 +154,9 @@ def train_autoencoder(
         eps=1e-8,
         weight_decay=float(config.get("autoencoder.weight_decay", 0.01)),
     )
-    epochs = int(config.get("autoencoder.epochs", 20))
+    epochs = int(config.get("autoencoder.max_epochs", config.get("autoencoder.epochs", 20)))
+    if epochs <= 0:
+        raise ValueError("autoencoder.max_epochs must be positive")
     stage_batch_size = int(config.get("autoencoder.batch_size", config.get("data.batch_size", 4)))
     if stage_batch_size <= 0:
         raise ValueError("autoencoder.batch_size must be positive")
