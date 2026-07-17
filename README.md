@@ -455,18 +455,19 @@ EMA 会额外保存一份模型参数。若 24 GB 环境仍无法容纳 full 阶
 统一运行：
 
 ```bash
-bash factory/run_pipeline.sh \
-  --ehr-pickle Dataset/generated/ukb_train_trajectories.pkl \
+CUDA_VISIBLE_DEVICES=3  bash factory/run_pipeline.sh \
+  --ehr-pickle ../../../../Dataset/generated/ukb_train_trajectories.pkl \
   --generator-checkpoint /data/home/wanglidi/code/p1/xdiabetes/weights/diffusion_full/best.pt \
   --autoencoder-checkpoint /data/home/wanglidi/code/p1/xdiabetes/weights/autoencoder/best.pt \
   --retfound-checkpoint /data/home/wanglidi/code/p1/xdiabetes/weights/RETFound_oct_weights.pth \
   --schema-project-root ../../../../ \
-  --output-root Dataset/generated/ukbehr_ehr_oct \
+  --output-root ../../../../Dataset/generated/ukbehr_ehr_oct \
   --samples-per-view 4 \
   --guidance-scale 4.0 \
   --inference-steps 50 \
   --seed 42
 ```
+> pid=3502162 , 2026.07.17 
 
 主要交付：
 
