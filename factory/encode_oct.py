@@ -107,6 +107,7 @@ def encode(args: argparse.Namespace) -> dict[str, Any]:
         "encoder_checkpoint": str(checkpoint_path),
         "generator_name": "oct_ehr_ldm",
         "generator_checkpoint": generation["generator_checkpoint"],
+        "generator_autoencoder_checkpoint": generation.get("autoencoder_checkpoint"),
         "preprocessing": {
             "rgb": True,
             "resize": [args.image_size, args.image_size],

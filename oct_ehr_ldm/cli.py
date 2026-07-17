@@ -53,6 +53,10 @@ def _base_parser() -> argparse.ArgumentParser:
 
     sample = subparsers.add_parser("sample", help="Generate OCT images from EHR-only or paired patient latents.")
     sample.add_argument("--checkpoint", required=True)
+    sample.add_argument(
+        "--autoencoder-checkpoint",
+        help="OCT autoencoder checkpoint. Defaults to paths.oct_autoencoder_checkpoint in the config.",
+    )
     sample.add_argument("--ehr-file", help="Defaults to paths.ehr_only in the config.")
     sample.add_argument("--patient-id", action="append", type=int, default=[])
     sample.add_argument("--all", action="store_true", help="Generate for every patient in --ehr-file.")
@@ -201,6 +205,7 @@ def main(argv: list[str] | None = None) -> None:
             ehr_path,
             patient_ids,
             args.output_dir,
+            autoencoder_checkpoint=args.autoencoder_checkpoint,
             view_codes=args.view_code,
             samples_per_view=args.samples_per_view,
             guidance_scale=args.guidance_scale,

@@ -65,11 +65,20 @@ def _projector_architecture(config: ProjectConfig, manifest: dict[str, Any]) -> 
     }
 
 
-def _load_autoencoder(config: ProjectConfig, device: torch.device) -> torch.nn.Module:
+def _load_autoencoder(
+    config: ProjectConfig,
+    device: torch.device,
+    checkpoint_path: str | Path | None = None,
+) -> torch.nn.Module:
     autoencoder = build_cxr_autoencoder(use_checkpointing=False)
+    resolved_checkpoint = (
+        Path(checkpoint_path).expanduser().resolve()
+        if checkpoint_path is not None
+        else config.path("paths.oct_autoencoder_checkpoint")
+    )
     load_module_checkpoint(
         autoencoder,
-        config.path("paths.oct_autoencoder_checkpoint"),
+        resolved_checkpoint,
         preferred_keys=("model", "autoencoder"),
         strict=True,
     )
@@ -726,6 +735,7 @@ def sample_conditioned_oct(
     ehr_path: str | Path,
     patient_ids: Iterable[int],
     output_dir: str | Path,
+    autoencoder_checkpoint: str | Path | None = None,
     view_codes: list[str] | None = None,
     samples_per_view: int = 1,
     guidance_scale: float = 4.0,
@@ -745,7 +755,7 @@ def sample_conditioned_oct(
         ema = ModuleEMA({"diffusion": diffusion, "projector": projector})
         ema.load_state_dict(checkpoint["ema"])
         ema.copy_to({"diffusion": diffusion, "projector": projector})
-    autoencoder = _load_autoencoder(config, device)
+    autoencoder = _load_autoencoder(config, device, autoencoder_checkpoint)
     ehr_by_patient = load_ehr_dictionary(ehr_path)
     selected_ids = [int(patient_id) for patient_id in patient_ids]
     absent = [patient_id for patient_id in selected_ids if patient_id not in ehr_by_patient]

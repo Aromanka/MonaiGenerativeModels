@@ -186,6 +186,9 @@ def package(args: argparse.Namespace) -> dict[str, Any]:
                             "source": "synthetic_oct",
                             "encoder": "RETFound",
                             "generator_checkpoint": oct_metadata["generator_checkpoint"],
+                            "autoencoder_checkpoint": oct_metadata.get(
+                                "generator_autoencoder_checkpoint"
+                            ),
                             "encoder_checkpoint": oct_metadata["encoder_checkpoint"],
                         },
                     ),
@@ -225,6 +228,9 @@ def package(args: argparse.Namespace) -> dict[str, Any]:
             "oct_manifest": str(oct_manifest_path),
             "patient_id_mode": patient_map["patient_id_mode"],
             "generator_checkpoint": oct_metadata["generator_checkpoint"],
+            "generator_autoencoder_checkpoint": oct_metadata.get(
+                "generator_autoencoder_checkpoint"
+            ),
             "encoder_name": oct_metadata["encoder_name"],
             "encoder_checkpoint": oct_metadata["encoder_checkpoint"],
         },
@@ -254,6 +260,9 @@ def package(args: argparse.Namespace) -> dict[str, Any]:
             "ehr_trajectories": str(trajectory_path),
             "generator_name": "oct_ehr_ldm",
             "generator_checkpoint": oct_metadata["generator_checkpoint"],
+            "generator_autoencoder_checkpoint": oct_metadata.get(
+                "generator_autoencoder_checkpoint"
+            ),
             "oct_encoder": oct_metadata["encoder_name"],
             "oct_encoder_checkpoint": oct_metadata["encoder_checkpoint"],
             "schema_api_root": str(schema_root),

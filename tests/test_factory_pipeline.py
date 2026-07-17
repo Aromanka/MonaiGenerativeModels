@@ -81,6 +81,7 @@ class FactoryCommonTests(unittest.TestCase):
                 ehr_pickle=str(trajectory_path),
                 config="configs/oct_ehr_ldm.json",
                 generator_checkpoint=str(root / "generator.pt"),
+                autoencoder_checkpoint=str(root / "autoencoder.pt"),
                 patient_id=[],
                 offset=0,
                 limit=None,
@@ -95,6 +96,7 @@ class FactoryCommonTests(unittest.TestCase):
                 no_ema=False,
             )
             (root / "generator.pt").touch()
+            (root / "autoencoder.pt").touch()
             with patch("factory.generate_oct.subprocess.run", side_effect=fake_sampler):
                 patient_map = generate(args)
             self.assertEqual(patient_map["entries"][0]["patient_id"], 50)

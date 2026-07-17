@@ -458,6 +458,7 @@ EMA 会额外保存一份模型参数。若 24 GB 环境仍无法容纳 full 阶
 bash factory/run_pipeline.sh \
   --ehr-pickle Dataset/generated/ukb_train_trajectories.pkl \
   --generator-checkpoint /data/home/wanglidi/code/p1/xdiabetes/weights/diffusion_full/best.pt \
+  --autoencoder-checkpoint /data/home/wanglidi/code/p1/xdiabetes/weights/autoencoder/best.pt \
   --retfound-checkpoint /data/home/wanglidi/code/p1/xdiabetes/weights/RETFound_oct_weights.pth \
   --schema-project-root ../../../../ \
   --output-root Dataset/generated/ukbehr_ehr_oct \

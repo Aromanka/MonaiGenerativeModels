@@ -17,6 +17,7 @@ This folder implements three independent, restartable stages:
 bash factory/run_pipeline.sh \
   --ehr-pickle Dataset/generated/ukb_train_trajectories.pkl \
   --generator-checkpoint outputs/diffusion_full/best.pt \
+  --autoencoder-checkpoint outputs/autoencoder/best.pt \
   --retfound-checkpoint /data/home/wanglidi/model/RETFound_oct_weights.pth \
   --schema-project-root ../../xdiabetes2 \
   --output-root Dataset/synthetic/ukbehr_ehr_oct \
@@ -29,6 +30,12 @@ bash factory/run_pipeline.sh \
 The defaults generate both UKB OCT views and map field `21017` to `left` and
 `21018` to `right`. Override or extend this mapping with repeated arguments,
 for example `--view-code 21017 --view-laterality 21017=left`.
+
+The unified pipeline requires `--autoencoder-checkpoint` and passes that exact
+path to OCT sampling. It does not use `paths.oct_autoencoder_checkpoint` from
+the JSON config. The lower-level `python -m oct_ehr_ldm sample` command still
+falls back to the config value when its optional `--autoencoder-checkpoint` is
+omitted.
 
 By default, source EIDs are preserved. To assign a disjoint sequential ID
 range (for example for a validation dataset), use:

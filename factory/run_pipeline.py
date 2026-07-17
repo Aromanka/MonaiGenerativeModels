@@ -22,6 +22,8 @@ def run(args: argparse.Namespace) -> None:
         str(resolve_path(args.ehr_pickle)),
         "--generator-checkpoint",
         str(resolve_path(args.generator_checkpoint)),
+        "--autoencoder-checkpoint",
+        str(resolve_path(args.autoencoder_checkpoint)),
         "--output-root",
         str(output_root),
         "--config",
@@ -102,6 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ehr-pickle", required=True)
     parser.add_argument("--generator-checkpoint", required=True)
+    parser.add_argument("--autoencoder-checkpoint", required=True)
     parser.add_argument("--retfound-checkpoint", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--config", default="configs/oct_ehr_ldm.json")

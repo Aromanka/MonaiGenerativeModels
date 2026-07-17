@@ -102,10 +102,13 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
     trajectory_path = resolve_path(args.ehr_pickle)
     config_path = resolve_path(args.config, base=REPO_ROOT)
     checkpoint_path = resolve_path(args.generator_checkpoint)
+    autoencoder_checkpoint_path = resolve_path(args.autoencoder_checkpoint)
     if not config_path.is_file():
         raise FileNotFoundError(config_path)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(checkpoint_path)
+    if not autoencoder_checkpoint_path.is_file():
+        raise FileNotFoundError(autoencoder_checkpoint_path)
     trajectories = load_trajectories(trajectory_path)
     source_ids = _select_source_ids(trajectories, args.patient_id, args.offset, args.limit)
     if not source_ids:
@@ -140,6 +143,8 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
         "sample",
         "--checkpoint",
         str(checkpoint_path),
+        "--autoencoder-checkpoint",
+        str(autoencoder_checkpoint_path),
         "--ehr-file",
         str(latent_path),
         "--all",
@@ -249,6 +254,7 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
         "generation": {
             "config": str(config_path),
             "generator_checkpoint": str(checkpoint_path),
+            "autoencoder_checkpoint": str(autoencoder_checkpoint_path),
             "view_codes": view_codes,
             "view_laterality": laterality_by_view,
             "samples_per_view": args.samples_per_view,
@@ -272,6 +278,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate auditable synthetic OCT images from EHR trajectories.")
     parser.add_argument("--ehr-pickle", required=True, help="Pickle containing payload['trajectories'].")
     parser.add_argument("--generator-checkpoint", required=True)
+    parser.add_argument("--autoencoder-checkpoint", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--config", default="configs/oct_ehr_ldm.json")
     parser.add_argument("--patient-id", action="append", type=int, default=[], help="Repeat to select source EIDs.")
