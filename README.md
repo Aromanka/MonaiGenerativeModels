@@ -448,3 +448,34 @@ EMA 会额外保存一份模型参数。若 24 GB 环境仍无法容纳 full 阶
 ### 为什么不直接使用 `ehr_only.pt` 训练
 
 这些患者没有配对 OCT，无法构造监督的 conditional diffusion target。它们的用途是训练完成后做缺失模态生成，而不是混入 paired training。
+
+# Generation With EHR input
+已完成 EHR → OCT → RETFound → Schema V2 数据工厂，全部脚本位于 [factory](</E:/code/project/xdiabetes/dtmh/generative/MonaiGenerativeModels/factory>)。
+
+统一运行：
+
+```bash
+bash factory/run_pipeline.sh \
+  --ehr-pickle Dataset/generated/ukb_train_trajectories.pkl \
+  --generator-checkpoint outputs/diffusion_full/best.pt \
+  --retfound-checkpoint /path/to/RETFound_oct_weights.pth \
+  --schema-project-root ../../xdiabetes2 \
+  --output-root Dataset/synthetic/ukbehr_ehr_oct \
+  --samples-per-view 4 \
+  --guidance-scale 4.0 \
+  --inference-steps 50 \
+  --seed 42
+```
+
+主要交付：
+
+- [generate_oct.py](</E:/code/project/xdiabetes/dtmh/generative/MonaiGenerativeModels/factory/generate_oct.py>)：读取 trajectory、生成并整理图片及 CSV manifest。
+- [encode_oct.py](</E:/code/project/xdiabetes/dtmh/generative/MonaiGenerativeModels/factory/encode_oct.py>)：复用现有 RETFound 实现，严格校验 1024 维特征。
+- [build_schema_v2.py](</E:/code/project/xdiabetes/dtmh/generative/MonaiGenerativeModels/factory/build_schema_v2.py>)：调用原生 Schema V2 API 打包最终训练文件。
+- [README.md](</E:/code/project/xdiabetes/dtmh/generative/MonaiGenerativeModels/factory/README.md>)：完整参数、恢复运行和顺序重编码说明。
+
+默认保留原始 EID；也支持 `--patient-id-mode sequential --sequential-start N` 创建互不重叠的 ID 区间。默认视图映射为 `21017=left`、`21018=right`，与 [UK Biobank 官方字段定义](https://biobank.ndph.ox.ac.uk/showcase/label.cgi?id=100016)一致。
+
+当 `--samples-per-view 4` 时，每位患者产生 4 个 Schema visit，每个 visit 包含左右眼两个 `[1024]` OCT token 和一个 `[120]` EHR token。
+
+验证结果：相关 11 项测试通过，包含图片整理、ID 隔离、双 visit Schema V2 端到端打包及原有 OCT-EHR 回归测试；完整上游测试套件因当前环境缺少既有 `monai`、`parameterized` 依赖未能全量收集。
