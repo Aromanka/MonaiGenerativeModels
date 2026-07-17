@@ -457,10 +457,10 @@ EMA 会额外保存一份模型参数。若 24 GB 环境仍无法容纳 full 阶
 ```bash
 bash factory/run_pipeline.sh \
   --ehr-pickle Dataset/generated/ukb_train_trajectories.pkl \
-  --generator-checkpoint outputs/diffusion_full/best.pt \
-  --retfound-checkpoint /path/to/RETFound_oct_weights.pth \
-  --schema-project-root ../../xdiabetes2 \
-  --output-root Dataset/synthetic/ukbehr_ehr_oct \
+  --generator-checkpoint /data/home/wanglidi/code/p1/xdiabetes/weights/diffusion_full/best.pt \
+  --retfound-checkpoint /data/home/wanglidi/code/p1/xdiabetes/weights/RETFound_oct_weights.pth \
+  --schema-project-root ../../../../ \
+  --output-root Dataset/generated/ukbehr_ehr_oct \
   --samples-per-view 4 \
   --guidance-scale 4.0 \
   --inference-steps 50 \
