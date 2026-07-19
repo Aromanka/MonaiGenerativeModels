@@ -469,6 +469,22 @@ CUDA_VISIBLE_DEVICES=3  bash factory/run_pipeline.sh \
 ```
 > pid=3502162 , 2026.07.17 
 
+分步：
+```bash
+CUDA_VISIBLE_DEVICES=3 python -m factory.encode_oct \
+  --output-root ../../../../Dataset/generated/ukbehr_ehr_oct \
+  --retfound-checkpoint /data/home/wanglidi/code/p1/xdiabetes/weights/RETFound_oct_weights.pth \
+  --batch-size 4 \
+  --num-workers 4 \
+  --device cuda
+
+python -m factory.build_schema_v2 \
+  --ehr-pickle ../../../../Dataset/generated/ukb_train_trajectories.pkl \
+  --output-root ../../../../Dataset/generated/ukbehr_ehr_oct \
+  --schema-project-root ../../../../
+```
+
+
 主要交付：
 
 - [generate_oct.py](</E:/code/project/xdiabetes/dtmh/generative/MonaiGenerativeModels/factory/generate_oct.py>)：读取 trajectory、生成并整理图片及 CSV manifest。
